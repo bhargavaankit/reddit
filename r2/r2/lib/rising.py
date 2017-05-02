@@ -16,21 +16,18 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from datetime import datetime
 import heapq
 
-from pylons import g
+from pylons import app_globals as g
 
 from r2.lib import count
-from r2.lib.cache import sgm
+from r2.lib.sgm import sgm
 from r2.models.link import Link
-
-
-CACHE_KEY = "rising"
 
 
 def calc_rising():
@@ -53,11 +50,11 @@ def calc_rising():
 
 
 def set_rising():
-    g.cache.set(CACHE_KEY, calc_rising())
+    g.gencache.set("all:rising", calc_rising())
 
 
 def get_all_rising():
-    return g.cache.get(CACHE_KEY, [])
+    return g.gencache.get("all:rising", [], stale=True)
 
 
 def get_rising(sr):
@@ -88,8 +85,13 @@ def normalized_rising(sr_ids):
     if not sr_ids:
         return []
 
-    tuples_by_srid = sgm(g.cache, sr_ids, miss_fn=get_rising_tuples,
-                         prefix='normalized_rising', time=g.page_cache_time)
+    tuples_by_srid = sgm(
+        cache=g.gencache,
+        keys=sr_ids,
+        miss_fn=get_rising_tuples,
+        prefix='rising:',
+        time=90,
+    )
 
     merged = heapq.merge(*tuples_by_srid.values())
 

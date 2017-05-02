@@ -64,6 +64,11 @@ r.wiki = {
 
     toggleHide: function(event) {
         event.preventDefault()
+
+        if (r.access.isLinkRestricted(this)) {
+            return;
+        }
+
         var $this = $(this),
             url = r.wiki.baseApiUrl() + '/hide',
             $this_parent = $this.parents('.revision')
@@ -148,7 +153,7 @@ r.wiki = {
                         ,specials = special.children('#specials')
                     specials.empty()
                     for(i in errors) {
-                        specials.append($('<p>').text(errors[i]))
+                        specials.append($('<pre>').text($.unsafe(errors[i])))
                     }
                     special.fadeIn('slow')
                 },

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -30,7 +30,8 @@ from r2.lib.pages.things import wrap_links
 from r2.models import IDBuilder, Listing
 
 import simplejson
-from pylons import c, g
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 
 
 class JsonResponse(object):
@@ -199,7 +200,8 @@ class JQueryResponse(JsonResponse):
                 selector += ".field-" + field_name
             message = c.errors[(error_name, field_name)].message
             form.find(selector).show().text(message).end()
-        return {"jquery": self.ops}
+        return {"jquery": self.ops,
+                "success": not self.has_error()}
 
     # thing methods
     #--------------
@@ -245,6 +247,10 @@ class JQueryResponse(JsonResponse):
             return self.find(selector).show().html(value).end()
         return self.find(selector).hide().html("").end()
 
+    def set_text(self, selector, value):
+        if value:
+            return self.find(selector).show().text(value).end()
+        return self.find(selector).hide().html("").end()
 
     def set(self, **kw):
         obj = self

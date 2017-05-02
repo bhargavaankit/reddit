@@ -16,18 +16,20 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from pylons import c, request
+from pylons import request
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 from pylons.i18n import _, N_
 
+from r2.config import feature
 from r2.lib.db import operators
 from r2.lib.filters import _force_unicode
-from r2.lib.search import sorts as search_sorts
 from r2.lib.strings import StringHandler, plurals
-from r2.lib.utils import  query_string, timeago
+from r2.lib.utils import  class_property, query_string, timeago
 from r2.lib.wrapped import Styled
 
 
@@ -56,43 +58,45 @@ menu =   MenuHandler(hot          = _('hot'),
                      gilded       = _('gilded'),
                      confidence   = _('best'),
                      random       = _('random'),
+                     qa           = _('q&a'),
                      saved        = _('saved {toolbar}'),
                      recommended  = _('recommended'),
-                     rising       = _('rising'), 
-                     admin        = _('admin'), 
-                                 
+                     rising       = _('rising'),
+                     admin        = _('admin'),
+
                      # time sort words
-                     hour         = _('this hour'),
-                     day          = _('today'),
-                     week         = _('this week'),
-                     month        = _('this month'),
-                     year         = _('this year'),
+                     hour         = _('past hour'),
+                     day          = _('past 24 hours'),
+                     week         = _('past week'),
+                     month        = _('past month'),
+                     year         = _('past year'),
                      all          = _('all time'),
-                                  
+
                      # "kind" words
                      spam         = _("spam"),
                      autobanned   = _("autobanned"),
 
                      # reddit header strings
-                     prefs        = _("preferences"), 
+                     prefs        = _("preferences"),
                      submit       = _("submit"),
                      wiki         = _("wiki"),
                      blog         = _("blog"),
                      logout       = _("logout"),
-                     
+
                      #reddit footer strings
+                     reddiquette  = _("reddiquette"),
                      contact      = _("contact us"),
                      buttons      = _("buttons"),
-                     widget       = _("widget"), 
-                     code         = _("source code"),
-                     mobile       = _("mobile"), 
-                     store        = _("store"),  
+                     widget       = _("widget"),
+                     mobile       = _("mobile"),
                      advertising  = _("advertise"),
                      gold         = _('reddit gold'),
                      reddits      = _('subreddits'),
-                     team         = _('team'),
-                     rules        = _('rules'),
+                     rules        = _('site rules'),
                      jobs         = _('jobs'),
+                     transparency = _("transparency"),
+                     source_code  = _("source code"),
+                     values       = _("values"),
 
                      #preferences
                      options      = _('options'),
@@ -101,17 +105,16 @@ menu =   MenuHandler(hot          = _('hot'),
                      friends      = _("friends"),
                      blocked      = _("blocked"),
                      update       = _("password/email"),
-                     delete       = _("delete"),
+                     deactivate   = _("deactivate"),
                      security     = _("security"),
 
                      # messages
-                     compose      = _("compose"),
+                     compose      = _("send a private message"),
                      inbox        = _("inbox"),
                      sent         = _("sent"),
 
                      # comments
                      comments     = _("comments {toolbar}"),
-                     related      = _("related"),
                      details      = _("details"),
                      duplicates   = _("other discussions (%(num)s)"),
                      traffic      = _("traffic stats"),
@@ -123,32 +126,40 @@ menu =   MenuHandler(hot          = _('hot'),
                      edit_subscriptions = _("edit subscriptions"),
                      community_settings = _("subreddit settings"),
                      edit_stylesheet    = _("edit stylesheet"),
-                     moderators   = _("edit moderators"),
+                     community_rules    = _("rules"),
+                     moderators   = _("moderators"),
                      modmail      = _("moderator mail"),
-                     contributors = _("edit approved submitters"),
+                     contributors = _("approved submitters"),
                      banned       = _("ban users"),
                      banusers     = _("ban users"),
+                     muted        = _("mute users"),
                      flair        = _("edit flair"),
                      log          = _("moderation log"),
                      modqueue     = _("moderation queue"),
-                     unmoderated  = _("unmoderated links"),
+                     unmoderated  = _("unmoderated posts"),
                      edited       = _("edited"),
-                     
+                     employee     = _("employee"),
+                     automod      = _("automoderator config"),
+                     new_automod  = _("get started with automoderator"),
+
                      wikibanned        = _("ban wiki contributors"),
                      wikicontributors  = _("add wiki contributors"),
-                     
+
                      wikirecentrevisions = _("recent wiki revisions"),
                      wikipageslist = _("wiki page list"),
 
                      popular      = _("popular"),
                      create       = _("create"),
                      mine         = _("my subreddits"),
+                     quarantine   = _("quarantine"),
+                     featured     = _("featured"),
 
                      i18n         = _("help translate"),
                      errors       = _("errors"),
                      awards       = _("awards"),
                      ads          = _("ads"),
                      promoted     = _("promoted"),
+                     sponsor      = _("sponsor"),
                      reporters    = _("reporters"),
                      reports      = _("reports"),
                      reportedauth = _("reported authors"),
@@ -157,8 +168,8 @@ menu =   MenuHandler(hot          = _('hot'),
 
                      overview     = _("overview"),
                      submitted    = _("submitted"),
-                     liked        = _("liked"),
-                     disliked     = _("disliked"),
+                     upvoted      = _("upvoted"),
+                     downvoted    = _("downvoted"),
                      hidden       = _("hidden {toolbar}"),
                      deleted      = _("deleted"),
                      reported     = _("reported"),
@@ -170,12 +181,13 @@ menu =   MenuHandler(hot          = _('hot'),
                      current_promos = _('all promoted links'),
                      all_promos     = _('all'),
                      future_promos  = _('unseen'),
-                     roadblock      = _('roadblock'),
+                     unapproved_campaigns = _('unapproved campaigns'),
                      inventory      = _('inventory'),
                      live_promos    = _('live'),
                      unpaid_promos  = _('unpaid'),
                      pending_promos = _('pending'),
                      rejected_promos = _('rejected'),
+                     edited_live_promos = _('edited live'),
 
                      sitewide = _('sitewide'),
                      languages = _('languages'),
@@ -267,8 +279,8 @@ class NavButton(Styled):
 
     _style = "plain"
 
-    def __init__(self, title, dest, sr_path=True, nocname=False, aliases=None,
-                 target="", use_params=False, css_class=''):
+    def __init__(self, title, dest, sr_path=True, aliases=None,
+                 target="", use_params=False, css_class='', data=None):
         aliases = aliases or []
         aliases = set(_force_unicode(a.rstrip('/')) for a in aliases)
         if dest:
@@ -279,10 +291,10 @@ class NavButton(Styled):
         self.selected = False
 
         self.sr_path = sr_path
-        self.nocname = nocname
         self.aliases = aliases
         self.target = target
         self.use_params = use_params
+        self.data = data
 
         Styled.__init__(self, self._style, css_class=css_class)
 
@@ -302,6 +314,8 @@ class NavButton(Styled):
     def is_selected(self):
         stripped_path = _force_unicode(request.path.rstrip('/').lower())
 
+        if not (self.sr_path or c.default_sr):
+            return False
         if stripped_path == self.bare_path:
             return True
         site_path = c.site.user_path.lower() + self.bare_path
@@ -323,20 +337,20 @@ class NavButton(Styled):
             ('title', self.title),
             ('path', self.path),
             ('sr_path', self.sr_path),
-            ('nocname', self.nocname),
-            ('target', self.target), 
+            ('target', self.target),
             ('css_class', self.css_class),
             ('_id', self._id),
+            ('data', self.data),
         ]
 
 
 class QueryButton(NavButton):
     def __init__(self, title, dest, query_param, sr_path=True, aliases=None,
-                 target="", css_class=''):
+                 target="", css_class='', data=None):
         self.query_param = query_param
-        NavButton.__init__(self, title, dest, sr_path=sr_path, nocname=True,
+        NavButton.__init__(self, title, dest, sr_path=sr_path,
                            aliases=aliases, target=target, use_params=False,
-                           css_class=css_class)
+                           css_class=css_class, data=data)
 
     def build(self, base_path=''):
         params = dict(request.GET)
@@ -359,11 +373,11 @@ class PostButton(NavButton):
     _style = "post"
 
     def __init__(self, title, dest, input_name, sr_path=True, aliases=None,
-                 target="", css_class=''):
+                 target="", css_class='', data=None):
         self.input_name = input_name
-        NavButton.__init__(self, title, dest, sr_path=sr_path, nocname=True,
+        NavButton.__init__(self, title, dest, sr_path=sr_path,
                            aliases=aliases, target=target, use_params=False,
-                           css_class=css_class)
+                           css_class=css_class, data=data)
 
     def build(self, base_path=''):
         self.base_path = base_path
@@ -379,6 +393,7 @@ class PostButton(NavButton):
             ('target', self.target),
             ('css_class', self.css_class),
             ('_id', self._id),
+            ('data', self.data),
         ]
 
     def is_selected(self):
@@ -417,13 +432,13 @@ class SubredditButton(NavButton):
     # TRANSLATORS: Gold feature, "myrandom", a random subreddit from your subscriptions
                       RandomSubscription: N_("myrandom")}
 
-    def __init__(self, sr, css_class=''):
+    def __init__(self, sr, css_class='', data=None):
         self.path = sr.path
         name = self.name_overrides.get(sr)
         name = _(name) if name else sr.name
         self.isselected = (c.site == sr)
-        NavButton.__init__(self, name, sr.path, sr_path=False, nocname=True,
-                           css_class=css_class)
+        NavButton.__init__(self, name, sr.path, sr_path=False,
+                           css_class=css_class, data=data)
 
     def build(self, base_path=''):
         self.bare_path = ""
@@ -437,6 +452,7 @@ class SubredditButton(NavButton):
             ('title', self.title),
             ('isselected', self.isselected),
             ('css_class', self.css_class),
+            ('data', self.data),
         ]
 
 
@@ -446,14 +462,16 @@ class NamedButton(NavButton):
     'dest' defaults to the 'name' as well (unless specified
     separately)."""
 
-    def __init__(self, name, sr_path=True, nocname=False, aliases=None,
-                 dest=None, fmt_args={}, css_class=''):
+    def __init__(self, name, sr_path=True, aliases=None,
+                 dest=None, fmt_args={}, use_params=False, css_class='',
+                 data=None):
         self.name = name.strip('/')
         menutext = menu[self.name] % fmt_args
         dest = dest if dest is not None else name
         NavButton.__init__(self, menutext, dest, sr_path=sr_path,
-                           nocname=nocname, aliases=aliases,
-                           css_class=css_class)
+                           aliases=aliases,
+                           use_params=use_params, css_class=css_class,
+                           data=data)
 
 
 class JsButton(NavButton):
@@ -462,12 +480,13 @@ class JsButton(NavButton):
 
     _style = "js"
 
-    def __init__(self, title, tab_name=None, onclick='', css_class=''):
+    def __init__(self, title, tab_name=None, onclick='', css_class='',
+                 data=None):
         self.tab_name = tab_name
         self.onclick = onclick
         dest = '#'
-        NavButton.__init__(self, title, dest, sr_path=False, nocname=True,
-                           css_class=css_class)
+        NavButton.__init__(self, title, dest, sr_path=False,
+                           css_class=css_class, data=data)
 
     def build(self, base_path=''):
         if self.tab_name:
@@ -482,11 +501,12 @@ class JsButton(NavButton):
         return [
             ('title', self.title),
             ('path', self.path),
-            ('target', self.target), 
+            ('target', self.target),
             ('css_class', self.css_class),
             ('_id', self._id),
             ('tab_name', self.tab_name),
             ('onclick', self.onclick),
+            ('data', self.data),
         ]
 
 
@@ -513,7 +533,8 @@ class SortMenu(NavMenu):
         options = self.make_buttons()
         default = default or self._default
         base_path = base_path or request.path
-        NavMenu.__init__(self, options, default=default, title=_(self._title),
+        title = title or _(self._title)
+        NavMenu.__init__(self, options, default=default, title=title,
                          type=self._type, base_path=base_path,
                          separator=separator, _id=_id, css_class=css_class)
 
@@ -537,6 +558,7 @@ class SortMenu(NavMenu):
         "controversial": operators.desc('_controversy'),
         "confidence": operators.desc('_confidence'),
         "random": operators.shuffled('_confidence'),
+        "qa": operators.desc('_qa'),
     }
     _reverse_mapping = {v: k for k, v in _mapping.iteritems()}
 
@@ -557,21 +579,51 @@ class ProfileSortMenu(SortMenu):
 class CommentSortMenu(SortMenu):
     """Sort menu for comments pages"""
     _default = 'confidence'
-    _options = ('confidence', 'top', 'new', 'hot', 'controversial', 'old',
-                 'random')
-    hidden_options = ('random',)
-    button_cls = PostButton
+    _options = ('confidence', 'top', 'new', 'controversial', 'old', 'random',
+                'qa',)
+    hidden_options = ['random']
+
+    # Links may have a suggested sort of 'blank', which is an explicit None -
+    # that is, do not check the subreddit for a suggested sort, either.
+    suggested_sort_options = _options + ('blank',)
+
+    def __init__(self, *args, **kwargs):
+        self.suggested_sort = kwargs.pop('suggested_sort', None)
+        super(CommentSortMenu, self).__init__(*args, **kwargs)
+
+    @classmethod
+    def visible_options(cls):
+        return set(cls._options) - set(cls.hidden_options)
+
+    def make_title(self, attr):
+        title = super(CommentSortMenu, self).make_title(attr)
+        if attr == self.suggested_sort:
+            return title + ' ' + _('(suggested)')
+        else:
+            return title
 
 
 class SearchSortMenu(SortMenu):
     """Sort menu for search pages."""
     _default = 'relevance'
-    mapping = search_sorts
-    _options = mapping.keys()
+    _options = ('relevance', 'hot', 'top', 'new', 'comments')
 
-    @classmethod
-    def operator(cls, sort):
-        return cls.mapping.get(sort, cls.mapping[cls.default])
+    @class_property
+    def hidden_options(cls):
+        return ['hot']
+
+    def make_buttons(self):
+        buttons = super(SearchSortMenu, self).make_buttons()
+        if feature.is_enabled('link_relevancy'):
+            button = self.button_cls('relevance2', 'relevance2', self.name)
+            buttons.append(button)
+        return buttons
+
+
+class SubredditSearchSortMenu(SortMenu):
+    """Sort menu for subreddit search pages."""
+    _default = 'relevance'
+    _options = ('relevance', 'activity')
 
 
 class RecSortMenu(SortMenu):
@@ -604,6 +656,15 @@ class TimeMenu(SortMenu):
         from r2.models import Link
         if time != 'all':
             return Link.c._date >= timeago(time)
+
+class CommentsTimeMenu(TimeMenu):
+    """Time Menu with the title changed for comments"""
+    _title = N_("comments from")
+
+
+class ProfileOverviewTimeMenu(TimeMenu):
+    """Time Menu with the title changed for a user overview"""
+    _title = N_("links and comments from")
 
 
 class ControversyTimeMenu(TimeMenu):

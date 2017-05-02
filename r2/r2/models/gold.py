@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -27,9 +27,10 @@ import pytz
 import uuid
 
 from pycassa import NotFoundException
-from pycassa.system_manager import INT_TYPE, UTF8_TYPE
+from pycassa.system_manager import ASCII_TYPE, INT_TYPE, TIME_UUID_TYPE, UTF8_TYPE
 from pycassa.util import convert_uuid_to_time
-from pylons import g, c
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 from pylons.i18n import _, ungettext
 from datetime import datetime
 import sqlalchemy as sa
@@ -48,13 +49,16 @@ from r2.lib.db import tdb_cassandra
 from r2.lib.db.tdb_cassandra import NotFound, view_of
 from r2.models import Account
 from r2.models.subreddit import Frontpage
-from r2.models.wiki import WikiPage
+from r2.models.wiki import WikiPage, WikiPageIniItem
 from r2.lib.memoize import memoize
 
 import stripe
 
 gold_bonus_cutoff = datetime(2010,7,27,0,0,0,0,g.tz)
 gold_static_goal_cutoff = datetime(2013, 11, 7, tzinfo=g.display_tz)
+
+NON_REVENUE_STATUSES = ("declined", "chargeback", "fudge", "invalid",
+                        "refunded", "reversed")
 
 ENGINE_NAME = 'authorize'
 
@@ -79,7 +83,8 @@ gold_table = sa.Table('reddit_gold', METADATA,
                       sa.Column('secret', sa.String, nullable = True),
                       sa.Column('account_id', sa.String, nullable = True),
                       sa.Column('days', sa.Integer, nullable = True),
-                      sa.Column('subscr_id', sa.String, nullable = True))
+                      sa.Column('subscr_id', sa.String, nullable = True),
+                      sa.Column('gilding_type', sa.String, nullable = True))
 
 indices = [index_str(gold_table, 'status', 'status'),
            index_str(gold_table, 'date', 'date'),
@@ -163,8 +168,8 @@ class GildedLinksByAccount(tdb_cassandra.DenormalizedRelation):
 class GildingsByThing(tdb_cassandra.View):
     _use_db = True
     _extra_schema_creation_args = {
-        "key_validation_class": tdb_cassandra.UTF8_TYPE,
-        "column_name_class": tdb_cassandra.UTF8_TYPE,
+        "key_validation_class": UTF8_TYPE,
+        "column_name_class": UTF8_TYPE,
     }
 
     @classmethod
@@ -187,11 +192,11 @@ class GildingsByThing(tdb_cassandra.View):
 @view_of(GildedLinksByAccount)
 class GildingsByDay(tdb_cassandra.View):
     _use_db = True
-    _compare_with = tdb_cassandra.TIME_UUID_TYPE
+    _compare_with = TIME_UUID_TYPE
     _extra_schema_creation_args = {
-        "key_validation_class": tdb_cassandra.ASCII_TYPE,
-        "column_name_class": tdb_cassandra.TIME_UUID_TYPE,
-        "default_validation_class": tdb_cassandra.UTF8_TYPE,
+        "key_validation_class": ASCII_TYPE,
+        "column_name_class": TIME_UUID_TYPE,
+        "default_validation_class": UTF8_TYPE,
     }
 
     @staticmethod
@@ -276,18 +281,21 @@ def create_claimed_gold (trans_id, payer_email, paying_id,
                                 account_id=account_id,
                                 date=date)
 
-def create_gift_gold (giver_id, recipient_id, days, date, signed, note=None):
-    trans_id = "X%d%s-%s" % (int(time()), randstr(2), 'S' if signed else 'A')
 
-    gold_table.insert().execute(trans_id=trans_id,
-                                status="gift",
-                                paying_id=giver_id,
-                                payer_email='',
-                                pennies=0,
-                                days=days,
-                                account_id=recipient_id,
-                                date=date,
-                                secret=note,
+def create_gift_gold(giver_id, recipient_id, days, date,
+            signed, note=None, gilding_type=None):
+    trans_id = "X%d%s-%s" % (int(time()), randstr(2), 'S' if signed else 'A')
+    gold_table.insert().execute(
+        trans_id=trans_id,
+        status="gift",
+        paying_id=giver_id,
+        payer_email='',
+        pennies=0,
+        days=days,
+        account_id=recipient_id,
+        date=date,
+        secret=note,
+        gilding_type=gilding_type,
     )
 
 
@@ -316,7 +324,7 @@ def create_gold_code(trans_id, payer_email, paying_id, pennies, days, date):
                 date=date)
             return code
 
-                
+
 def account_by_payingid(paying_id):
     s = sa.select([sa.distinct(gold_table.c.account_id)],
                   gold_table.c.paying_id == paying_id)
@@ -374,6 +382,11 @@ def check_by_email(email):
                            gold_table.c.account_id],
                           gold_table.c.payer_email == email)
     return s.execute().fetchall()
+
+
+def has_prev_subscr_payments(subscr_id):
+    s = sa.select([gold_table], gold_table.c.subscr_id == subscr_id)
+    return bool(s.execute().fetchall())
 
 
 def retrieve_gold_transaction(transaction_id):
@@ -444,7 +457,6 @@ def append_random_bottlecap_phrase(message):
 
 
 def gold_revenue_multi(dates):
-    NON_REVENUE_STATUSES = ("declined", "chargeback", "fudge")
     date_expr = sa.func.date_trunc('day',
                     sa.func.timezone(TIMEZONE.zone, gold_table.c.date))
     query = (select([date_expr, sa_sum(gold_table.c.pennies)])
@@ -456,20 +468,25 @@ def gold_revenue_multi(dates):
                 for truncated_time, pennies in ENGINE.execute(query)}
 
 
-@memoize("gold-revenue-volatile", time=600)
+@memoize("gold-revenue-volatile", time=600, stale=True)
 def gold_revenue_volatile(date):
     return gold_revenue_multi([date]).get(date, 0)
 
 
-@memoize("gold-revenue-steady")
+@memoize("gold-revenue-steady", stale=True)
 def gold_revenue_steady(date):
     return gold_revenue_multi([date]).get(date, 0)
 
 
-@memoize("gold-goal")
+@memoize("gold-goal", stale=True)
 def gold_goal_on(date):
     """Returns the gold revenue goal (in pennies) for a given date."""
-    return GoldRevenueGoalByDate.get(date)
+    goal = GoldRevenueGoalByDate.get(date)
+
+    if not goal:
+        return 0
+
+    return float(goal)
 
 
 def account_from_stripe_customer_id(stripe_customer_id):
@@ -504,6 +521,10 @@ def get_subscription_details(user):
         return
 
     return _get_subscription_details(user.gold_subscr_id)
+
+
+def paypal_subscription_url():
+    return "https://www.paypal.com/cgi-bin/webscr?cmd=_subscr-find&alias=%s" % g.goldpayment_email
 
 
 def get_discounted_price(gold_price):
@@ -609,3 +630,17 @@ def get_current_value_of_month():
     now = datetime.now(g.display_tz)
     seconds = calculate_server_seconds(price, now)
     return seconds
+
+
+class StylesheetsEverywhere(WikiPageIniItem):
+    @classmethod
+    def _get_wiki_config(cls):
+        return Frontpage, g.wiki_page_stylesheets_everywhere
+
+    def __init__(self, id, tagline, thumbnail_url, preview_url, is_enabled=True):
+        self.id = id
+        self.tagline = tagline
+        self.thumbnail_url = thumbnail_url
+        self.preview_url = preview_url
+        self.is_enabled = is_enabled
+        self.checked = False

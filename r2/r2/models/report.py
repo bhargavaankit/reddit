@@ -16,28 +16,36 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from collections import Counter
 
-from r2.lib.db.thing import Thing, Relation, MultiRelation, thing_prefix
+from r2.lib.db.thing import Relation, MultiRelation
 from r2.lib.utils import tup
-from r2.lib.memoize import memoize
 from r2.models import Link, Comment, Message, Subreddit, Account
-from r2.models.vote import score_changes
-from datetime import datetime
 
-from pylons import g
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 
-class Report(MultiRelation('report',
-                           Relation(Account, Link),
-                           Relation(Account, Comment),
-                           Relation(Account, Subreddit),
-                           Relation(Account, Message)
-                           )):
 
+_LinkReport = Relation(Account, Link)
+_CommentReport = Relation(Account, Comment)
+_SubredditReport = Relation(Account, Subreddit)
+_MessageReport = Relation(Account, Message)
+REPORT_RELS = (_LinkReport, _CommentReport, _SubredditReport, _MessageReport)
+
+for report_cls in REPORT_RELS:
+    report_cls._cache = g.thingcache
+
+_LinkReport._cache_prefix = classmethod(lambda cls: "reportlink:")
+_CommentReport._cache_prefix = classmethod(lambda cls: "reportcomment:")
+_SubredditReport._cache_prefix = classmethod(lambda cls: "reportsr:")
+_MessageReport._cache_prefix = classmethod(lambda cls: "reportmessage:")
+
+
+class Report(MultiRelation('report', *REPORT_RELS)):
     _field = 'reported'
 
     @classmethod
@@ -60,8 +68,6 @@ class Report(MultiRelation('report',
             kw['reason'] = reason
 
         r = Report(user, thing, '0', **kw)
-        if not thing._loaded:
-            thing._load()
 
         # mark item as reported
         try:
@@ -104,9 +110,8 @@ class Report(MultiRelation('report',
         for thing in things:
             things_by_cls.setdefault(thing.__class__, []).append(thing)
 
-        to_clear = []
-
         for thing_cls, cls_things in things_by_cls.iteritems():
+            to_clear = []
             # look up all of the reports for each thing
             rel_cls = cls.rel(Account, thing_cls)
             thing_ids = [t._id for t in cls_things]
@@ -122,12 +127,14 @@ class Report(MultiRelation('report',
                     thing._commit()
                     to_clear.append(thing)
 
-        queries.clear_reports(to_clear, rels)
+            queries.clear_reports(to_clear, rels)
 
     @classmethod
     def get_reports(cls, wrapped, max_user_reasons=20):
         """Get two lists of mod and user reports on the item."""
-        if wrapped.can_ban and wrapped.reported > 0:
+        if (wrapped.reported > 0 and
+                (wrapped.can_ban or
+                 getattr(wrapped, "promoted", None) and c.user_is_sponsor)):
             from r2.models import SRMember
 
             reports = cls.for_thing(wrapped.lookups[0])
@@ -136,12 +143,20 @@ class Report(MultiRelation('report',
                                     SRMember.c._name == "moderator")
             mod_dates = {rel._thing2_id: rel._date for rel in query}
 
+            if g.automoderator_account:
+                automoderator = Account._by_name(g.automoderator_account)
+            else:
+                automoderator = None
+
             mod_reports = []
             user_reports = []
 
             for report in reports:
+                # always include AutoModerator reports
+                if automoderator and report._thing1_id == automoderator._id:
+                    mod_reports.append(report)
                 # include in mod reports if made after the user became a mod
-                if (report._thing1_id in mod_dates and
+                elif (report._thing1_id in mod_dates and
                         report._date >= mod_dates[report._thing1_id]):
                     mod_reports.append(report)
                 else:

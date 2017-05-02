@@ -16,24 +16,35 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
+from r2.lib import amqp
 from r2.lib.db import tdb_cassandra
+from r2.lib.db.thing import NotFound
 from r2.lib.errors import MessageError
 from r2.lib.utils import tup, fetch_things2
 from r2.lib.filters import websafe
 from r2.lib.hooks import HookRegistrar
-from r2.lib.log import log_text
-from r2.models import Account, Message, Report, Subreddit
+from r2.models import (
+    Account,
+    Comment,
+    Link,
+    Message,
+    NotFound,
+    Report,
+    Subreddit,
+)
 from r2.models.award import Award
 from r2.models.gold import append_random_bottlecap_phrase, creddits_lock
 from r2.models.token import AwardClaimToken
 from r2.models.wiki import WikiPage
 
 from _pylibmc import MemcachedError
-from pylons import g, c, config
+from pylons import config
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 from pylons.i18n import _
 
 from datetime import datetime, timedelta
@@ -87,11 +98,23 @@ class AdminTools(object):
             t.ban_info = ban_info
             t._commit()
 
+            if auto:
+                amqp.add_item("auto_removed", t._fullname)
+
         if not auto:
             self.author_spammer(new_things, True)
             self.set_last_sr_ban(new_things)
 
         queries.ban(all_things, filtered=auto)
+
+        for t in all_things:
+            if auto:
+                amqp.add_item("auto_removed", t._fullname)
+
+            if isinstance(t, Comment):
+                amqp.add_item("removed_comment", t._fullname)
+            elif isinstance(t, Link):
+                amqp.add_item("removed_link", t._fullname)
 
     def unspam(self, things, moderator_unbanned=True, unbanner=None,
                train_spam=True, insert=True):
@@ -127,6 +150,11 @@ class AdminTools(object):
             else:
                 t.verdict = 'admin-approved'
             t._commit()
+
+            if isinstance(t, Comment):
+                amqp.add_item("approved_comment", t._fullname)
+            elif isinstance(t, Link):
+                amqp.add_item("approved_link", t._fullname)
 
         self.author_spammer(things, False)
         self.set_last_sr_ban(things)
@@ -168,33 +196,42 @@ class AdminTools(object):
                 sr._commit()
                 sr._incr('mod_actions', len(sr_things))
 
-    def engolden(self, account, days):
-        account.gold = True
-
+    def adjust_gold_expiration(self, account, days=0, months=0, years=0):
         now = datetime.now(g.display_tz)
+        if months % 12 == 0:
+            years += months / 12
+        else:
+            days += months * 31
+        days += years * 366
 
         existing_expiration = getattr(account, "gold_expiration", None)
         if existing_expiration is None or existing_expiration < now:
             existing_expiration = now
         account.gold_expiration = existing_expiration + timedelta(days)
+        
+        if account.gold_expiration > now and not account.gold:
+            self.engolden(account)
+        elif account.gold_expiration <= now and account.gold:
+            self.degolden(account)
 
+        account._commit()     
+
+    def engolden(self, account):
+        now = datetime.now(g.display_tz)
+        account.gold = True
         description = "Since " + now.strftime("%B %Y")
+        
         trophy = Award.give_if_needed("reddit_gold", account,
                                      description=description,
                                      url="/gold/about")
         if trophy and trophy.description.endswith("Member Emeritus"):
             trophy.description = description
             trophy._commit()
-        account._commit()
 
+        account._commit()
         account.friend_rels_cache(_update=True)
 
-    def degolden(self, account, severe=False):
-
-        if severe:
-            account.gold_charter = False
-            Award.take_away("charter_subscriber", account)
-
+    def degolden(self, account):
         Award.take_away("reddit_gold", account)
         account.gold = False
         account._commit()
@@ -237,7 +274,7 @@ def all_gold_users():
                        data=True, sort="_id")
     return fetch_things2(q)
 
-def accountid_from_paypalsubscription(subscr_id):
+def accountid_from_subscription(subscr_id):
     if subscr_id is None:
         return None
 
@@ -259,7 +296,7 @@ def update_gold_users():
                   "rants, suggestions about reddit gold, please write "
                   "to us at %(gold_email)s. Your feedback would be "
                   "much appreciated.\n\nThank you for your past "
-                  "patronage.") % {'gold_email': g.goldthanks_email}
+                  "patronage.") % {'gold_email': g.goldsupport_email}
 
     for account in all_gold_users():
         days_left = (account.gold_expiration - now).days
@@ -267,7 +304,7 @@ def update_gold_users():
             if account.pref_creddit_autorenew:
                 with creddits_lock(account):
                     if account.gold_creddits > 0:
-                        admintools.engolden(account, 31)
+                        admintools.adjust_gold_expiration(account, days=31)
                         account.gold_creddits -= 1
                         account._commit()
                         continue
@@ -298,9 +335,6 @@ def update_gold_users():
                                     distinguished='gold-auto')
 
 
-def admin_ratelimit(user):
-    return True
-
 def is_banned_domain(dom):
     return None
 
@@ -310,110 +344,23 @@ def is_shamed_domain(dom):
 def bans_for_domain_parts(dom):
     return []
 
-def valid_thing(v, karma, *a, **kw):
-    return not v._thing1._spam
 
-def valid_user(v, sr, karma, *a, **kw):
-    return True
-
-def apply_updates(user):
+def apply_updates(user, timer):
     pass
 
-def update_score(obj, up_change, down_change, vote, old_valid_thing):
-     obj._incr('_ups',   up_change)
-     obj._incr('_downs', down_change)
-
-
-def _is_controversial(w, item):
-    """Determine if an item meets all criteria to display as controversial."""
-    cfg = g.live_config
-    votes = max(item._ups + item._downs, 1)
-
-    # A sample-size threshold before posts can be considered controversial
-    if votes < cfg['cflag_min_votes']:
-        return False
-
-    # If an item falls within a boundary of upvote ratios, it's controversial
-    # e.g. 0.4 < x < 0.6
-    if cfg['cflag_lower_bound'] <= w.upvote_ratio <= cfg['cflag_upper_bound']:
-        return True
-
-    return False
-
-
-def compute_votes(wrapper, item):
-    wrapper.upvotes   = item._ups
-    wrapper.downvotes = item._downs
-    total_votes = max(item._ups + item._downs, 1)
-    wrapper.upvote_ratio = float(item._ups) / total_votes
-    wrapper.is_controversial = (c.user.pref_highlight_controversial and
-                                _is_controversial(wrapper, item))
 
 def ip_span(ip):
     ip = websafe(ip)
     return '<!-- %s -->' % ip
 
-def filter_quotas(unfiltered):
-    now = datetime.now(g.tz)
-
-    baskets = {
-        'hour':  [],
-        'day':   [],
-        'week':  [],
-        'month': [],
-        }
-
-    new_quotas = []
-    quotas_changed = False
-
-    for item in unfiltered:
-        delta = now - item._date
-
-        age = delta.days * 86400 + delta.seconds
-
-        # First, select a basket or abort if item is too old
-        if age < 3600:
-            basket = 'hour'
-        elif age < 86400:
-            basket = 'day'
-        elif age < 7 * 86400:
-            basket = 'week'
-        elif age < 30 * 86400:
-            basket = 'month'
-        else:
-            quotas_changed = True
-            continue
-
-        verdict = getattr(item, "verdict", None)
-        approved = verdict and verdict in (
-            'admin-approved', 'mod-approved')
-
-        # Then, make sure it's worthy of quota-clogging
-        if item._spam:
-            pass
-        elif item._deleted:
-            pass
-        elif item._score <= 0:
-            pass
-        elif age < 86400 and item._score <= g.QUOTA_THRESHOLD and not approved:
-            pass
-        else:
-            quotas_changed = True
-            continue
-
-        baskets[basket].append(item)
-        new_quotas.append(item._fullname)
-
-    if quotas_changed:
-        return baskets, new_quotas
-    else:
-        return baskets, None
-
 
 def wiki_template(template_slug, sr=None):
     """Pull content from a subreddit's wiki page for internal use."""
     if not sr:
-        sr = Subreddit._by_name(g.default_sr)
+        try:
+            sr = Subreddit._by_name(g.default_sr)
+        except NotFound:
+            return None
 
     try:
         wiki = WikiPage.get(sr, "templates/%s" % template_slug)
@@ -425,22 +372,22 @@ def wiki_template(template_slug, sr=None):
 
 @admintools_hooks.on("account.registered")
 def send_welcome_message(user):
-    welcome_title = wiki_template("welcome_title").format(
-        username=user.name,
-    )
-    welcome_message = wiki_template("welcome_message").format(
-        username=user.name,
-    )
+    welcome_title = wiki_template("welcome_title")
+    welcome_message = wiki_template("welcome_message")
 
     if not welcome_title or not welcome_message:
         g.log.warning("Unable to send welcome message: invalid wiki templates.")
         return
 
+    welcome_title = welcome_title.format(username=user.name)
+    welcome_message = welcome_message.format(username=user.name)
+
     return send_system_message(user, welcome_title, welcome_message)
 
 
 def send_system_message(user, subject, body, system_user=None,
-                        distinguished='admin', repliable=False):
+                        distinguished='admin', repliable=False,
+                        add_to_sent=True, author=None, signed=False):
     from r2.lib.db import queries
 
     if system_user is None:
@@ -449,15 +396,19 @@ def send_system_message(user, subject, body, system_user=None,
         g.log.warning("Can't send system message "
                       "- invalid system_user or g.system_user setting")
         return
+    if not author:
+        author = system_user
 
-    item, inbox_rel = Message._new(system_user, user, subject, body,
+    item, inbox_rel = Message._new(author, user, subject, body,
                                    ip='0.0.0.0')
     item.distinguished = distinguished
     item.repliable = repliable
+    item.display_author = system_user._id
+    item.signed = signed
     item._commit()
 
     try:
-        queries.new_message(item, inbox_rel)
+        queries.new_message(item, inbox_rel, add_to_sent=add_to_sent)
     except MemcachedError:
         raise MessageError('reddit_inbox')
 

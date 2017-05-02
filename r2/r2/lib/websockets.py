@@ -16,19 +16,18 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 """Utilities for interfacing with the WebSocket server Sutro."""
 
-import hashlib
-import hmac
+import datetime
 import json
-import time
 import urllib
 import urlparse
 
-from pylons import g
+from baseplate.crypto import MessageSigner
+from pylons import app_globals as g
 
 from r2.lib import amqp
 from r2.lib.filters import websafe_json
@@ -61,13 +60,12 @@ def make_url(namespace, max_age):
 
     """
 
-    expires = str(int(time.time() + max_age))
-    mac = hmac.new(g.secrets["websocket"], expires + namespace,
-                   hashlib.sha1).hexdigest()
+    signer = MessageSigner(g.secrets["websocket"])
+    signature = signer.make_signature(
+        namespace, max_age=datetime.timedelta(seconds=max_age))
 
     query_string = urllib.urlencode({
-        "h": mac,
-        "e": expires,
+        "m": signature,
     })
 
     return urlparse.urlunparse(("wss", g.websocket_host, namespace,

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -41,7 +41,7 @@ else
 $(error $(DEFS_PY) failed. aborting)
 endif
 
-#################### Cython
+#################### Generated code: Cython + Thrift
 PYX_FILES := $(shell find . -name \*.pyx)
 PYX_C_FILES := $(PYX_FILES:.pyx=.c)
 PYX_SO_FILES := $(PYX_FILES:.pyx=.so)
@@ -49,13 +49,14 @@ PYX_SO_FILES := $(PYX_FILES:.pyx=.so)
 .PHONY: pyx clean_pyx
 
 pyx:
-	$(PYTHON) setup.py build_ext --inplace
+	$(PYTHON) setup.py build
+	$(PYTHON) setup.py build_ext --inplace  # copy the .so files from cython into the source tree
 
 clean_pyx:
 	rm -f $(PYX_C_FILES) $(PYX_SO_FILES)
 
 #################### i18n
-STRINGS_FILE := r2/lib/strings.py
+STRINGS_FILE := r2/lib/generate_strings.py
 GENERATED_STRINGS_FILE := r2/lib/generated_strings.py
 
 .PHONY: i18n clean_i18n
@@ -65,7 +66,7 @@ i18n: $(GENERATED_STRINGS_FILE)
 	$(PYTHON) setup.py extract_messages --input-dirs=r2,$(PLUGIN_I18N_PATHS) -o $(POTFILE)
 
 $(GENERATED_STRINGS_FILE): $(STRINGS_FILE)
-	paster run standalone $(STRINGS_FILE) -c "generate_strings()" > $(GENERATED_STRINGS_FILE)
+	$(PYTHON) $(STRINGS_FILE) > $(GENERATED_STRINGS_FILE)
 
 clean_i18n:
 	rm -f $(GENERATED_STRINGS_FILE)
@@ -85,8 +86,8 @@ clean_ini:
 	rm $(INIFILES)
 
 #################### CSS file lists
-SPRITED_STYLESHEETS += reddit.less compact.css
-LESS_STYLESHEETS := wiki.less adminbar.less policies.less
+SPRITED_STYLESHEETS += reddit.less compact.css modtools.less expando.less
+LESS_STYLESHEETS := wiki.less adminbar.less policies.less reddit-embed.less
 OTHER_STYLESHEETS := mobile.css highlight.css
 
 #################### Static Files
@@ -162,10 +163,10 @@ $(MINIFIED_OTHER_STYLESHEETS): $(STATIC_BUILD_DIR)/%.css: $(CSS_SOURCE_DIR)/%.cs
 $(STATIC_BUILD_DIR)/sprite-%.png $(STATIC_BUILD_DIR)/%.css: $(CSS_SOURCE_DIR)/%.less $(STATIC_BUILDSTAMP)
 	# see above
 	rm -f $(STATIC_BUILD_DIR)/sprite-$*.png $(STATIC_BUILD_DIR)/$*.css
-	$(PYTHON) r2/lib/nymph.py $(CSS_SOURCE_DIR)/$*.less $(STATIC_BUILD_DIR)/sprite-$*.png > $(STATIC_BUILD_DIR)/$*.less.tmp
-	$(LESSC) $(STATIC_BUILD_DIR)/$*.less.tmp > $(STATIC_BUILD_DIR)/$*.css.tmp
+	$(PYTHON) r2/lib/nymph.py $(CSS_SOURCE_DIR)/$*.less $(STATIC_BUILD_DIR)/sprite-$*.png > $(CSS_SOURCE_DIR)/$*.less.tmp
+	$(LESSC) $(CSS_SOURCE_DIR)/$*.less.tmp > $(STATIC_BUILD_DIR)/$*.css.tmp
 	$(CSS_COMPRESS) < $(STATIC_BUILD_DIR)/$*.css.tmp > $(STATIC_BUILD_DIR)/$*.css
-	rm $(STATIC_BUILD_DIR)/$*.less.tmp $(STATIC_BUILD_DIR)/$*.css.tmp
+	rm $(CSS_SOURCE_DIR)/$*.less.tmp $(STATIC_BUILD_DIR)/$*.css.tmp
 
 # deprecated; remove once compact.scss has been converted to LESS
 $(STATIC_BUILD_DIR)/sprite-%.png $(STATIC_BUILD_DIR)/%.css: $(CSS_SOURCE_DIR)/%.css $(STATIC_BUILDSTAMP)
@@ -186,7 +187,7 @@ define JS_MODULE_TEMPLATE
 $(JS_MODULE_OUTPUTS_$(1)): $(JS_MODULE_DEPS_$(1)) r2/lib/js.py
 	# remove mangled output symlinks, similar to above.
 	rm -f $(JS_MODULE_OUTPUTS_$(1))
-	paster run standalone r2/lib/js.py -c "build_module('$(1)')"
+	$(PYTHON) r2/lib/js.py build_module "$(1)"
 	touch $$@
 endef
 

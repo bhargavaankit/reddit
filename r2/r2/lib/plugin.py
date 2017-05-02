@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -24,8 +24,6 @@ import sys
 import os.path
 import pkg_resources
 from collections import OrderedDict
-
-from pylons import config
 
 
 class Plugin(object):
@@ -136,8 +134,8 @@ class PluginLoader(object):
         for plugin in self:
             plugin.declare_queues(queues)
 
-    def load_plugins(self):
-        g = config['pylons.g']
+    def load_plugins(self, config):
+        g = config['pylons.app_globals']
         for plugin in self:
             # Record plugin version
             entry = plugin.entry_point

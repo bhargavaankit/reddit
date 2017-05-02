@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -39,10 +39,21 @@ thingcls_by_name = {
     "link": Link,
     "comment": Comment,
 }
+data_fields_by_name = {
+    "link": {
+        "url": str,
+        "sr_id": int,
+        "author_id": int,
+    },
+    "comment": {
+        "sr_id": int,
+        "author_id": int,
+    },
+}
 
 
-def join_things():
-    mr_tools.join_things(('url', 'sr_id', 'author_id'))
+def join_things(thing_type):
+    mr_tools.join_things(data_fields_by_name[thing_type].keys())
 
 
 def _get_cutoffs(intervals):
@@ -56,14 +67,10 @@ def _get_cutoffs(intervals):
     return cutoffs
 
 
-def time_listings(intervals):
+def time_listings(intervals, thing_type):
     cutoff_by_interval = _get_cutoffs(intervals)
 
-    @mr_tools.dataspec_m_thing(
-        ("url", str),
-        ("sr_id", int),
-        ("author_id", int),
-    )
+    @mr_tools.dataspec_m_thing(*data_fields_by_name[thing_type].items())
     def process(thing):
         if thing.deleted:
             return
@@ -121,14 +128,26 @@ def store_keys(key, maxes):
     elif category == "domain":
         if thing_cls == "link":
             query = queries.get_domain_links(id, sort, time)
-    assert query
+
+    assert query, 'unknown query type for %s' % (key,)
 
     item_tuples = [tuple([item[-1]] + [float(x) for x in item[:-1]])
                    for item in maxes]
-    query._replace(item_tuples)
 
+    # we only need locking updates for non-time-based listings, since for time-
+    # based ones we're the only ones that ever update it
+    lock = time == 'all'
+
+    query._replace(item_tuples, lock=lock)
 
 def write_permacache(fd = sys.stdin):
     mr_tools.mr_reduce_max_per_key(lambda x: map(float, x[:-1]), num=1000,
                                    post=store_keys,
+                                   fd = fd)
+
+def reduce_listings(fd=sys.stdin):
+    # like write_permacache, but just sends the reduced version of the listing
+    # to stdout instead of to the permacache. It's handy for debugging to see
+    # the final result before it's written out
+    mr_tools.mr_reduce_max_per_key(lambda x: map(float, x[:-1]), num=1000,
                                    fd = fd)

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -74,11 +74,11 @@ class ModeratorPermissionSet(PermissionSet):
     info = dict(
         access=dict(
             title=N_('access'),
-            description=N_('manage the lists of contributors and banned users'),
+            description=N_('manage the lists of contributors and banned/muted users'),
         ),
         config=dict(
             title=N_('config'),
-            description=N_('edit settings, sidebar, css, and images'),
+            description=N_('edit settings, sidebar, css, images, and AutoModerator config'),
         ),
         flair=dict(
             title=N_('flair'),

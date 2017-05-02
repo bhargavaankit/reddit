@@ -16,23 +16,22 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from r2.models import Link, Subreddit
 from r2.lib import utils
 from r2.lib.db.operators import desc
-from pylons import g, config
+from pylons import config
+from pylons import app_globals as g
+
 
 count_period = g.rising_period
 
 #stubs
 
 def incr_counts(wrapped):
-    pass
-
-def incr_sr_count(sr):
     pass
 
 def get_link_counts(period = count_period):

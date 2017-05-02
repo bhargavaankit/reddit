@@ -16,12 +16,17 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from r2.lib.pages.pages import Reddit, SubredditStylesheetSource
-from pylons import c
+from r2.lib.pages.pages import (
+    AutoModeratorConfig,
+    RawCode,
+    Reddit,
+    SubredditStylesheetSource,
+)
+from pylons import tmpl_context as c
 from r2.lib.wrapped import Templated
 from r2.lib.menus import PageNameNav
 from r2.lib.validator.wiki import this_may_revise
@@ -38,6 +43,11 @@ class WikiView(Templated):
             self.page_content = safemarkdown(content)
         elif renderer == 'stylesheet':
             self.page_content = SubredditStylesheetSource(content).render()
+        elif renderer == "automoderator":
+            self.page_content = AutoModeratorConfig(content).render()
+        elif renderer == "rawcode":
+            self.page_content = RawCode(content).render()
+
         self.renderer = renderer
         self.page = page
         self.diff = diff
@@ -101,13 +111,13 @@ class WikiBasePage(Reddit):
                  showtitle=False, **context):
         pageactions = []
         if not actionless and page:
-            pageactions += [(page, _("view"), False)]
+            pageactions += [(page, _("view"), False, 'wikiview')]
             if may_revise:
-                pageactions += [('edit', _("edit"), True)]
-            pageactions += [('revisions/%s' % page, _("history"), False)]
-            pageactions += [('discussions', _("talk"), True)]
+                pageactions += [('edit', _("edit"), True, 'wikiedit')]
+            pageactions += [('revisions/%s' % page, _("history"), False, 'wikirevisions')]
+            pageactions += [('discussions', _("talk"), True, 'wikidiscussions')]
             if c.is_wiki_mod and may_revise:
-                pageactions += [('settings', _("settings"), True)]
+                pageactions += [('settings', _("settings"), True, 'wikisettings')]
 
         action = context.get('wikiaction', (page, 'wiki'))
         

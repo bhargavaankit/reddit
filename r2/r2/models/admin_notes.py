@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -25,7 +25,7 @@ from datetime import datetime
 
 from pycassa.system_manager import UTF8_TYPE, TIME_UUID_TYPE
 from pycassa.util import convert_uuid_to_time
-from pylons import g
+from pylons import app_globals as g
 
 from r2.lib.db import tdb_cassandra
 

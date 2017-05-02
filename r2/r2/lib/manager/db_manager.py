@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -93,7 +93,12 @@ class db_manager:
     def setup_db(self, db_name, g_override=None, **params):
         engine = get_engine(g_override=g_override, **params)
         self._engines[db_name] = engine
-        self.test_engine(engine, g_override)
+
+        if db_name not in ("email", "authorize", "hc", "traffic"):
+            # test_engine creates a connection to the database, for some less
+            # important and less used databases we will skip this and only
+            # create the connection if it's needed
+            self.test_engine(engine, g_override)
 
     def things_iter(self):
         for name, engines in self._things.iteritems():

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -67,15 +67,19 @@ def load_controllers():
     from post import PostController
     from toolbar import ToolbarController
     from awards import AwardsController
-    from errorlog import ErrorlogController
+    from newsletter import NewsletterController
+    from googletagmanager import GoogleTagManagerController
     from promotecontroller import PromoteController
+    from promotecontroller import SponsorController
     from promotecontroller import PromoteApiController
     from promotecontroller import PromoteListingController
+    from promotecontroller import SponsorListingController
     from mediaembed import MediaembedController
     from mediaembed import AdController
+    from oembed import OEmbedController
     from policies import PoliciesController
     from web import WebLogController
-    
+
     from wiki import WikiController
     from wiki import WikiApiController
 
@@ -83,7 +87,9 @@ def load_controllers():
     from api import ApiminimalController
     from api_docs import ApidocsController
     from apiv1.user import APIv1UserController
+    from apiv1.login import APIv1LoginController
     from apiv1.gold import APIv1GoldController
+    from apiv1.scopes import APIv1ScopesController
     from multi import MultiApiController
     from oauth2 import OAuth2FrontendController
     from oauth2 import OAuth2AccessController
@@ -93,5 +99,6 @@ def load_controllers():
     from ipn import StripeController
     from ipn import CoinbaseController
     from ipn import RedditGiftsController
+    from mailgun import MailgunWebhookController
 
     _reddit_controllers.update((name.lower(), obj) for name, obj in locals().iteritems())

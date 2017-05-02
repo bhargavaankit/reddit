@@ -16,17 +16,25 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from pylons import request, g, c
+from pylons import request
+from pylons import tmpl_context as c
+from pylons import app_globals as g
+
 from reddit_base import RedditController
 from r2.controllers.oauth2 import require_oauth2_scope
 from r2.lib.utils import url_links_builder
 from reddit_base import paginated_listing
-from r2.models.wiki import (WikiPage, WikiRevision, ContentLengthError,
-                            modactions)
+from r2.models.wiki import (
+    ContentLengthError,
+    modactions,
+    WikiPage,
+    WikiPageExists,
+    WikiRevision,
+)
 from r2.models.subreddit import Subreddit
 from r2.models.modaction import ModAction
 from r2.models.builder import WikiRevisionBuilder, WikiRecentRevisionBuilder
@@ -43,6 +51,7 @@ from r2.lib.validator import (
     VInt,
     VMarkdown,
     VModhash,
+    VNotInTimeout,
     VOneOf,
     VPrintable,
     VRatelimit,
@@ -78,21 +87,30 @@ from r2.lib.utils import timesince
 from r2.config import extensions
 from r2.lib.base import abort
 from r2.lib.errors import reddit_http_error
+from r2.lib.automoderator import Ruleset
 
 import json
 
-page_descriptions = {'config/stylesheet':_("This page is the subreddit stylesheet, changes here apply to the subreddit css"),
-                     'config/submit_text':_("The contents of this page appear on the submit page"),
-                     'config/sidebar':_("The contents of this page appear on the subreddit sidebar"),
-                     'config/description':_("The contents of this page appear in the public subreddit description")}
+page_descriptions = {
+    "config/stylesheet": _("This page is the subreddit stylesheet, changes here apply to the subreddit css"),
+    "config/submit_text": _("The contents of this page appear on the submit page"),
+    "config/sidebar": _("The contents of this page appear on the subreddit sidebar"),
+    "config/description": _("The contents of this page appear in the public subreddit description and when the user does not have access to the subreddit"),
+    "config/automoderator": _("This page is used to configure AutoModerator for the subreddit, please see [the full documentation](/wiki/automoderator/full-documentation) for information"),
+}
 
 ATTRIBUTE_BY_PAGE = {"config/sidebar": "description",
                      "config/submit_text": "submit_text",
                      "config/description": "public_description"}
-RENDERERS_BY_PAGE = {"config/sidebar": "reddit",
-                     "config/submit_text": "reddit",
-                     "config/description": "reddit",
-                     "config/stylesheet": "stylesheet"}
+RENDERERS_BY_PAGE = {
+    "config/automoderator": "automoderator",
+    "config/description": "reddit",
+    "config/sidebar": "reddit",
+    "config/stylesheet": "stylesheet",
+    "config/submit_text": "reddit",
+    "toolbox": "rawcode",
+    "usernotes": "rawcode",
+}
 
 class WikiController(RedditController):
     allow_stylesheets = True
@@ -189,6 +207,8 @@ class WikiController(RedditController):
         if error:
             error = error.msg_params
         if wp[0]:
+            VNotInTimeout().run(action_name="wikirevise",
+                details_text="create", target=page)
             return self.redirect(join_urls(c.wiki_base_url, wp[0].name))
         elif api:
             if error:
@@ -205,11 +225,19 @@ class WikiController(RedditController):
                 error_msg = _('a max of %d separators "/" are allowed in a wiki page name.') % error['max_separators']
             return BoringPage(_("Wiki error"), infotext=error_msg).render()
         else:
+            VNotInTimeout().run(action_name="wikirevise",
+                details_text="create")
             return WikiCreate(page=page, may_revise=True).render()
 
     @validate(wp=VWikiPageRevise('page', restricted=True, required=True))
     def GET_wiki_revise(self, wp, page, message=None, **kw):
         wp = wp[0]
+        VNotInTimeout().run(action_name="wikirevise", details_text="revise",
+            target=wp)
+        error = c.errors.get(('MAY_NOT_REVISE', 'page'))
+        if error:
+            self.handle_error(403, **(error.msg_params or {}))
+        
         previous = kw.get('previous', wp._get('revision'))
         content = kw.get('content', wp.content)
         if not message and wp.name in page_descriptions:
@@ -264,6 +292,8 @@ class WikiController(RedditController):
         """Retrieve the current permission settings for `page`"""
         settings = {'permlevel': page._get('permlevel', 0),
                     'listed': page.listed}
+        VNotInTimeout().run(action_name="pageview",
+                details_text="wikisettings", target=page)
         mayedit = page.get_editor_accounts()
         restricted = (not page.special) and page.restricted
         show_editors = not restricted
@@ -274,13 +304,22 @@ class WikiController(RedditController):
 
     @require_oauth2_scope("modwiki")
     @api_doc(api_section.wiki, uri='/wiki/settings/{page}', uses_site=True)
-    @validate(VModhash(),
-              page=VWikiPage('page', restricted=True, modonly=True),
-              permlevel=VInt('permlevel'),
-              listed=VBoolean('listed'))
+    @validate(
+        VModhash(),
+        page=VWikiPage('page', restricted=True, modonly=True),
+        permlevel=VInt('permlevel'),
+        listed=VBoolean('listed'),
+    )
     def POST_wiki_settings(self, page, permlevel, listed):
         """Update the permissions and visibility of wiki `page`"""
         oldpermlevel = page.permlevel
+        if oldpermlevel != permlevel:
+            VNotInTimeout().run(action_name="wikipermlevel",
+                details_text="edit", target=page)
+        if page.listed != listed:
+            VNotInTimeout().run(action_name="wikipagelisted",
+                details_text="edit", target=page)
+
         try:
             page.change_permlevel(permlevel)
         except ValueError:
@@ -350,15 +389,27 @@ class WikiApiController(WikiController):
         """Edit a wiki `page`"""
         page, previous = pageandprevious
 
+        if c.user._spam:
+            error = _("You are doing that too much, please try again later.")
+            self.handle_error(415, 'SPECIAL_ERRORS', special_errors=[error])
+
         if not page:
             error = c.errors.get(('WIKI_CREATE_ERROR', 'page'))
             if error:
                 self.handle_error(403, **(error.msg_params or {}))
-            if not c.user._spam:
+
+            VNotInTimeout().run(action_name="wikirevise", details_text="create")
+            try:
                 page = WikiPage.create(c.site, page_name)
-        if c.user._spam:
-            error = _("You are doing that too much, please try again later.")
-            self.handle_error(415, 'SPECIAL_ERRORS', special_errors=[error])
+            except WikiPageExists:
+                self.handle_error(400, 'WIKI_CREATE_ERROR')
+
+        else:
+            VNotInTimeout().run(action_name="wikirevise", details_text="edit",
+                target=page)
+            error = c.errors.get(('MAY_NOT_REVISE', 'page'))
+            if error:
+                self.handle_error(403, **(error.msg_params or {}))
 
         renderer = RENDERERS_BY_PAGE.get(page.name, 'wiki')
         if renderer in ('wiki', 'reddit'):
@@ -370,6 +421,7 @@ class WikiApiController(WikiController):
         # In order to avoid breaking functionality, this was done instead.
         previous = previous._id if previous else request.POST.get('previous')
         try:
+            # special validation methods
             if page.name == 'config/stylesheet':
                 css_errors, parsed = c.site.parse_css(content, verify=False)
                 if g.css_killswitch:
@@ -377,6 +429,15 @@ class WikiApiController(WikiController):
                 if css_errors:
                     error_items = [CssError(x).message for x in css_errors]
                     self.handle_error(415, 'SPECIAL_ERRORS', special_errors=error_items)
+            elif page.name == "config/automoderator":
+                try:
+                    rules = Ruleset(content)
+                except ValueError as e:
+                    error_items = [e.message]
+                    self.handle_error(415, "SPECIAL_ERRORS", special_errors=error_items)
+
+            # special saving methods
+            if page.name == "config/stylesheet":
                 c.site.change_css(content, parsed, previous, reason=reason)
             else:
                 try:
@@ -386,13 +447,14 @@ class WikiApiController(WikiController):
 
                 # continue storing the special pages as data attributes on the subreddit
                 # object. TODO: change this to minimize subreddit get sizes.
-                if page.special:
+                if page.special and page.name in ATTRIBUTE_BY_PAGE:
                     setattr(c.site, ATTRIBUTE_BY_PAGE[page.name], content)
                     c.site._commit()
 
                 if page.special or c.is_wiki_mod:
                     description = modactions.get(page.name, 'Page %s edited' % page.name)
-                    ModAction.create(c.site, c.user, 'wikirevise', details=description)
+                    ModAction.create(c.site, c.user, "wikirevise",
+                        details=description, description=reason)
         except ConflictException as e:
             self.handle_error(409, 'EDIT_CONFLICT', newcontent=e.new, newrevision=page.revision, diffcontent=e.htmldiff)
         return json.dumps({})
@@ -411,8 +473,12 @@ class WikiApiController(WikiController):
         if not user:
             self.handle_error(404, 'UNKNOWN_USER')
         elif act == 'del':
+            VNotInTimeout().run(action_name="wikipermlevel",
+                details_text="del_editor", target=user)
             page.remove_editor(user._id36)
         elif act == 'add':
+            VNotInTimeout().run(action_name="wikipermlevel",
+                details_text="allow_editor", target=user)
             page.add_editor(user._id36)
         else:
             self.handle_error(400, 'INVALID_ACTION')
@@ -444,6 +510,9 @@ class WikiApiController(WikiController):
         page, revision = pv
         if not revision:
             self.handle_error(400, 'INVALID_REVISION')
+
+        VNotInTimeout().run(action_name="wikirevise",
+                details_text="revision_hide", target=page)
         return json.dumps({'status': revision.toggle_hide()})
 
     @require_oauth2_scope("modwiki")
@@ -456,6 +525,8 @@ class WikiApiController(WikiController):
         page, revision = pv
         if not revision:
             self.handle_error(400, 'INVALID_REVISION')
+        VNotInTimeout().run(action_name="wikirevise",
+                details_text="revision_revert", target=page)
         content = revision.content
         reason = 'reverted back %s' % timesince(revision.date)
         if page.name == 'config/stylesheet':
@@ -469,7 +540,7 @@ class WikiApiController(WikiController):
 
                 # continue storing the special pages as data attributes on the subreddit
                 # object. TODO: change this to minimize subreddit get sizes.
-                if page.special:
+                if page.name in ATTRIBUTE_BY_PAGE:
                     setattr(c.site, ATTRIBUTE_BY_PAGE[page.name], content)
                     c.site._commit()
             except ContentLengthError as e:

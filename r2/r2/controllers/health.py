@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -24,7 +24,8 @@ import json
 import os
 
 import pylibmc
-from pylons import g, request, response
+from pylons import request, response
+from pylons import app_globals as g
 from pylons.controllers.util import abort
 
 from r2.controllers.reddit_base import MinimalController
@@ -32,9 +33,6 @@ from r2.lib import promote, cache
 
 
 class HealthController(MinimalController):
-    def try_pagecache(self):
-        pass
-
     def pre(self):
         pass
 
@@ -68,7 +66,9 @@ class HealthController(MinimalController):
                     # libmemcached doesn't support UDP get/fetch operations
                     continue
                 mc = pylibmc.Client([server], behaviors=behaviors)
-                mc.get("__health_check_%s__" % server)
+                # it's ok that not all caches are mcrouter, we'll just ignore
+                # the miss either way
+                mc.get("__mcrouter__.version")
                 results[server] = "OK"
             except pylibmc.Error as e:
                 g.log.warning("Health check for %s FAILED: %s", server, e)

@@ -17,24 +17,13 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 import os
 import fnmatch
 import sys
-
-
-try:
-    import pkg_resources
-except ImportError:
-    print "Distribute >= 0.6.16 is required to run this."
-    sys.exit(1)
-else:
-    pkg_resources.require("distribute>=0.6.16")
-
-
 from setuptools import setup, find_packages, Extension
 
 
@@ -54,29 +43,35 @@ else:
     pyx_extensions = cythonize(pyx_files)
 
 
+# guard against import errors in case this is the first run of setup.py and we
+# don't have any dependencies (including baseplate) yet
+try:
+    from baseplate.integration.thrift.command import ThriftBuildPyCommand
+except ImportError:
+    print "Cannot find Baseplate. Skipping Thrift build."
+else:
+    commands["build_py"] = ThriftBuildPyCommand
+
+
 setup(
     name="r2",
     version="",
     install_requires=[
-        "webob==1.0.8",
-        "webtest<=1.4.3",  # anything newer requires WebOb>=1.2.0
-        "Pylons==0.9.7",
-        "Routes==1.11",
+        "Pylons",
+        "Routes",
         "mako>=0.5",
         "boto >= 2.0",
         "pytz",
         "pycrypto",
         "Babel>=1.0",
         "cython>=0.14",
-        "SQLAlchemy==0.7.4",
+        "SQLAlchemy",
         "BeautifulSoup",
         "chardet",
         "psycopg2",
         "pycassa>=1.7.0",
-        "PIL",
         "pycaptcha",
         "amqplib",
-        "pylibmc>=1.2.1",
         "py-bcrypt",
         "snudown>=1.1.0",
         "l2cs>=2.0.2",
@@ -85,7 +80,19 @@ setup(
         "stripe",
         "requests",
         "tinycss2",
+        "unidecode",
+        "PyYAML",
+        "Pillow",
+        "pylibmc==1.2.2",
+        "webob",
+        "webtest",
+        "python-snappy",
+        "httpagentparser==1.7.8",
+        "raven",
     ],
+    # setup tests (allowing for "python setup.py test")
+    tests_require=['mock', 'nose', 'coverage'],
+    test_suite="nose.collector",
     dependency_links=[
         "https://github.com/reddit/snudown/archive/v1.1.3.tar.gz#egg=snudown-1.1.3",
         "https://s3.amazonaws.com/code.reddit.com/pycaptcha-0.4.tar.gz#egg=pycaptcha-0.4",
@@ -111,5 +118,24 @@ setup(
     [r2.provider.media]
     s3 = r2.lib.providers.media.s3:S3MediaProvider
     filesystem = r2.lib.providers.media.filesystem:FileSystemMediaProvider
+    [r2.provider.cdn]
+    fastly = r2.lib.providers.cdn.fastly:FastlyCdnProvider
+    cloudflare = r2.lib.providers.cdn.cloudflare:CloudFlareCdnProvider
+    null = r2.lib.providers.cdn.null:NullCdnProvider
+    [r2.provider.auth]
+    cookie = r2.lib.providers.auth.cookie:CookieAuthenticationProvider
+    http = r2.lib.providers.auth.http:HttpAuthenticationProvider
+    [r2.provider.support]
+    zendesk = r2.lib.providers.support.zendesk:ZenDeskProvider
+    [r2.provider.search]
+    cloudsearch = r2.lib.providers.search.cloudsearch:CloudSearchProvider
+    solr = r2.lib.providers.search.solr:SolrSearchProvider
+    [r2.provider.image_resizing]
+    imgix = r2.lib.providers.image_resizing.imgix:ImgixImageResizingProvider
+    no_op = r2.lib.providers.image_resizing.no_op:NoOpImageResizingProvider
+    unsplashit = r2.lib.providers.image_resizing.unsplashit:UnsplashitImageResizingProvider
+    [r2.provider.email]
+    null = r2.lib.providers.email.null:NullEmailProvider
+    mailgun = r2.lib.providers.email.mailgun:MailgunEmailProvider
     """,
 )

@@ -16,10 +16,11 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
-from pylons import request, response, g
+from pylons import request, response
+from pylons import app_globals as g
 
 from r2.controllers.reddit_base import MinimalController
 from r2.lib.base import abort
@@ -28,9 +29,6 @@ from r2.lib import utils
 
 
 class RobotsController(MinimalController):
-    def try_pagecache(self):
-        pass
-
     def pre(self):
         pass
 
@@ -38,7 +36,22 @@ class RobotsController(MinimalController):
         pass
 
     def on_crawlable_domain(self):
-        return utils.domain(request.host) == g.domain
+        # This ensures we don't have the port included.
+        requested_domain = utils.domain(request.host)
+
+        # If someone CNAMEs myspammysite.com to reddit.com or something, we
+        # don't want search engines to index that.
+        if not utils.is_subdomain(requested_domain, g.domain):
+            return False
+
+        # Only allow the canonical desktop site and mobile subdomains, since
+        # we have canonicalization set up appropriately for them.
+        # Note: in development, DomainMiddleware needs to be temporarily
+        # modified to not skip assignment of reddit-domain-extension on
+        # localhost for this to work properly.
+        return (requested_domain == g.domain or
+                request.environ.get('reddit-domain-extension') in
+                    ('mobile', 'compact'))
 
     def GET_robots(self):
         response.content_type = "text/plain"

@@ -16,12 +16,15 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from pylons import c, g, config
+from pylons import config
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 from pylons.i18n import N_
+
 from r2.lib.wrapped import Templated
 from r2.lib.pages import LinkInfoBar, Reddit
 from r2.lib.menus import (
@@ -110,7 +113,12 @@ class AdminNotesSidebar(Templated):
         Templated.__init__(self)
 
 
-class AdminLinkInfoBar(LinkInfoBar): pass
+class AdminLinkInfoBar(LinkInfoBar):
+    pass
+
+
+class AdminDetailsBar(Templated):
+    pass
 
 
 if config['r2.import_private']:

@@ -16,7 +16,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -27,9 +27,11 @@ from base64 import urlsafe_b64encode
 
 from pycassa.system_manager import ASCII_TYPE, DATE_TYPE, UTF8_TYPE
 
-from pylons import g, c
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 from pylons.i18n import _
 
+from r2.lib import hooks
 from r2.lib.db import tdb_cassandra
 from r2.lib.db.thing import NotFound
 from r2.models.account import Account
@@ -143,6 +145,14 @@ class OAuth2Scope:
             "name": _("My Identity"),
             "description": _("Access my reddit username and signup date."),
         },
+        "modcontributors": {
+            "id": "modcontributors",
+            "name": _("Approve submitters and ban users"),
+            "description": _(
+                "Add/remove users to approved submitter lists and "
+                "ban/unban or mute/unmute users from subreddits I moderate."
+            ),
+        },
         "modflair": {
             "id": "modflair",
             "name": _("Moderate Flair"),
@@ -168,6 +178,23 @@ class OAuth2Scope:
             "name": _("Moderation Log"),
             "description": _(
                 "Access the moderation log in subreddits I moderate."),
+        },
+        "modothers": {
+            "id": "modothers",
+            "name": _("Invite or remove other moderators"),
+            "description": _(
+                "Invite or remove other moderators from subreddits I moderate."
+            ),
+        },
+        "modself": {
+            "id": "modself",
+            "name": _("Make changes to your subreddit moderator "
+                      "and contributor status"),
+            "description": _(
+                "Accept invitations to moderate a subreddit. Remove myself as "
+                "a moderator or contributor of subreddits I moderate or "
+                "contribute to."
+            ),
         },
         "modtraffic": {
             "id": "modtraffic",
@@ -265,14 +292,14 @@ class OAuth2Scope:
         else:
             self.subreddit_only = False
             self.subreddits = set()
-        self.scopes = set(scopes.split(','))
+        self.scopes = set(scopes.replace(',', ' ').split(' '))
 
     def __str__(self):
         if self.subreddit_only:
             sr_part = '+'.join(sorted(self.subreddits)) + ':'
         else:
             sr_part = ''
-        return sr_part + ','.join(sorted(self.scopes))
+        return sr_part + ' '.join(sorted(self.scopes))
 
     def has_access(self, subreddit, required_scopes):
         if self.FULL_ACCESS in self.scopes:
@@ -280,6 +307,12 @@ class OAuth2Scope:
         if self.subreddit_only and subreddit not in self.subreddits:
             return False
         return (self.scopes >= required_scopes)
+
+    def has_any_scope(self, required_scopes):
+        if self.FULL_ACCESS in self.scopes:
+            return True
+
+        return bool(self.scopes & required_scopes)
 
     def is_valid(self):
         return all(scope in self.scope_info for scope in self.scopes)
@@ -347,10 +380,14 @@ class OAuth2Client(Token):
     max_developers = 20
     token_size = 10
     client_secret_size = 20
+    _bool_props = (
+        "deleted",
+    )
     _float_props = (
         "max_reqs_sec",
     )
     _defaults = dict(name="",
+                     deleted=False,
                      description="",
                      about_url="",
                      icon_url="",
@@ -363,6 +400,9 @@ class OAuth2Client(Token):
     _connection_pool = "main"
 
     _developer_colname_prefix = 'has_developer_'
+
+    APP_TYPES = ("web", "installed", "script")
+    PUBLIC_APP_TYPES = ("installed",)
 
     @classmethod
     def _new(cls, **kwargs):
@@ -387,9 +427,8 @@ class OAuth2Client(Token):
     def _developers(self):
         """Returns a list of users who are developers of this client."""
 
-        devs = Account._byID(list(self._developer_ids))
-        return [dev for dev in devs.itervalues()
-                if not (dev._deleted or dev._spam)]
+        devs = Account._byID(list(self._developer_ids), return_dict=False)
+        return [dev for dev in devs if not dev._deleted]
 
     def _developer_colname(self, account):
         """Developer access is granted by way of adding a column with the
@@ -402,7 +441,7 @@ class OAuth2Client(Token):
     def has_developer(self, account):
         """Returns a boolean indicating whether or not the supplied Account is a developer of this application."""
 
-        if account._deleted or account._spam:
+        if account._deleted:
             return False
         else:
             return getattr(self, self._developer_colname(account), False)
@@ -443,7 +482,7 @@ class OAuth2Client(Token):
     def _by_developer(cls, account):
         """Returns a (possibly empty) list of clients for which Account is a developer."""
 
-        if account._deleted or account._spam:
+        if account._deleted:
             return []
 
         try:
@@ -453,8 +492,7 @@ class OAuth2Client(Token):
 
         clients = cls._byID(cba._values().keys())
         return [client for client in clients.itervalues()
-                if not getattr(client, 'deleted', False)
-                    and client.has_developer(account)]
+                if not client.deleted and client.has_developer(account)]
 
     @classmethod
     def _by_user(cls, account):
@@ -508,6 +546,13 @@ class OAuth2Client(Token):
             if token.client_id == self._id:
                 token.revoke()
 
+    def is_confidential(self):
+        return self.app_type not in self.PUBLIC_APP_TYPES
+
+    def is_first_party(self):
+        return self.has_developer(Account.system_user())
+
+
 class OAuth2ClientsByDeveloper(tdb_cassandra.View):
     """Index providing access to the list of OAuth2Clients of which an Account is a developer."""
 
@@ -557,27 +602,39 @@ class OAuth2AccessToken(Token):
     _ttl = datetime.timedelta(minutes=60)
     _defaults = dict(scope="",
                      token_type="bearer",
-                     refresh_token=None,
+                     refresh_token="",
+                     user_id="",
                     )
     _use_db = True
     _connection_pool = "main"
 
     @classmethod
-    def _new(cls, client_id, user_id, scope, refresh_token=None):
+    def _new(cls, client_id, user_id, scope, refresh_token=None, device_id=None):
+        try:
+            user_id_prefix = int(user_id, 36)
+        except (ValueError, TypeError):
+            user_id_prefix = ""
+        _id = "%s-%s" % (user_id_prefix, cls._generate_unique_token())
         return super(OAuth2AccessToken, cls)._new(
+                     _id=_id,
                      client_id=client_id,
                      user_id=user_id,
                      scope=str(scope),
-                     refresh_token=refresh_token)
+                     refresh_token=refresh_token,
+                     device_id=device_id,
+        )
 
     @classmethod
     def _by_user_view(cls):
         return OAuth2AccessTokensByUser
 
     def _on_create(self):
-        """Updates the by-user view upon creation."""
+        hooks.get_hook("oauth2.create_token").call(token=self)
 
-        self._by_user_view()._set_values(str(self.user_id), {self._id: ''})
+        # update the by-user view
+        if self.user_id:
+            self._by_user_view()._set_values(str(self.user_id), {self._id: ''})
+
         return super(OAuth2AccessToken, self)._on_create()
 
     def check_valid(self):
@@ -590,18 +647,22 @@ class OAuth2AccessToken(Token):
         # Is the OAuth2Client still valid?
         try:
             client = OAuth2Client._byID(self.client_id)
-            if getattr(client, 'deleted', False):
+            if client.deleted:
                 raise NotFound
+        except AttributeError:
+            g.log.error("bad token %s: %s", self, self._t)
+            raise
         except NotFound:
             return False
 
         # Is the user account still valid?
-        try:
-            account = Account._byID36(self.user_id)
-            if account._deleted:
-                raise NotFound
-        except NotFound:
-            return False
+        if self.user_id:
+            try:
+                account = Account._byID36(self.user_id)
+                if account._deleted:
+                    raise NotFound
+            except NotFound:
+                return False
 
         return True
 
@@ -611,14 +672,17 @@ class OAuth2AccessToken(Token):
         self.revoked = True
         self._commit()
 
-        try:
-            tba = self._by_user_view()._byID(self.user_id)
-            del tba[self._id]
-        except (tdb_cassandra.NotFound, KeyError):
-            # Not fatal, since self.check_valid() will still be False.
-            pass
-        else:
-            tba._commit()
+        if self.user_id:
+            try:
+                tba = self._by_user_view()._byID(self.user_id)
+                del tba[self._id]
+            except (tdb_cassandra.NotFound, KeyError):
+                # Not fatal, since self.check_valid() will still be False.
+                pass
+            else:
+                tba._commit()
+
+        hooks.get_hook("oauth2.revoke_token").call(token=self)
 
     @classmethod
     def revoke_all_by_user(cls, account):
@@ -654,6 +718,13 @@ class OAuth2RefreshToken(OAuth2AccessToken):
 
     _type_prefix = None
     _ttl = None
+
+    def _on_create(self):
+        if self.user_id:
+            self._by_user_view()._set_values(str(self.user_id), {self._id: ''})
+
+        # skip OAuth2AccessToken._on_create to avoid "oauth2.create_token" hook
+        return Token._on_create(self)
 
     @classmethod
     def _by_user_view(cls):
@@ -751,4 +822,5 @@ class AwardClaimToken(ConsumableToken):
 
     def confirm_url(self):
         # Full URL; for emailing, PM'ing, etc.
-        return "http://%s/awards/confirm/%s" % (g.domain, self._id)
+        base = g.https_endpoint or g.origin
+        return "%s/awards/confirm/%s" % (base, self._id)

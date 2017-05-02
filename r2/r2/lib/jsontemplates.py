@@ -16,22 +16,34 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 import calendar
+from collections import defaultdict
 
 from utils import to36, tup, iters
-from wrapped import Wrapped, StringTemplate, CacheStub, CachedVariable, Templated
+from wrapped import Wrapped, StringTemplate, CacheStub, Templated
 from mako.template import Template
+from r2.config import feature
 from r2.config.extensions import get_api_subtype
-from r2.lib.filters import spaceCompress, safemarkdown
-from r2.models import Account, Report
-from r2.models.subreddit import SubSR
+from r2.lib import hooks
+from r2.lib.filters import spaceCompress, safemarkdown, _force_unicode
+from r2.models import (
+    Account,
+    Comment,
+    Link,
+    Report,
+    Subreddit,
+    SubredditUserRelations,
+    Trophy,
+)
 from r2.models.token import OAuth2Scope, extra_oauth2_scope
 import time, pytz
-from pylons import c, g
+from pylons import response
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 from pylons.i18n import _
 
 from r2.models.wiki import ImagesByWikiPage
@@ -51,7 +63,7 @@ class ObjectTemplate(StringTemplate):
     def update(self, kw):
         def _update(obj):
             if isinstance(obj, (str, unicode)):
-                return StringTemplate(obj).finalize(kw)
+                return _force_unicode(obj)
             elif isinstance(obj, dict):
                 return dict((k, _update(v)) for k, v in obj.iteritems())
             elif isinstance(obj, (list, tuple)):
@@ -65,16 +77,74 @@ class ObjectTemplate(StringTemplate):
 
     def finalize(self, kw = {}):
         return self.update(kw).d
-    
+
+
 class JsonTemplate(Template):
     def __init__(self): pass
 
     def render(self, thing = None, *a, **kw):
         return ObjectTemplate({})
 
+
 class TakedownJsonTemplate(JsonTemplate):
     def render(self, thing = None, *a, **kw):
         return thing.explanation
+
+
+class ThingTemplate(object):
+    @classmethod
+    def render(cls, thing):
+        """
+        Return a JSON representation of a Wrapped Thing object.
+
+        The Thing object should be Wrapped and been run through add_props just
+        like is required for regular HTML rendering. The return value is an
+        ObjectTemplate wrapped dictionary.
+
+        """
+
+        api_subtype = get_api_subtype()
+
+        # the argument is named `thing` due to specifics of wrapped
+        item = thing
+
+        if api_subtype:
+            # special handling for rendering a nested template as a different
+            # style (usually html)
+            data = cls.get_rendered(item, render_style=api_subtype)
+        else:
+            data = cls.get_json(item)
+
+        d = {
+            "kind": cls.get_kind(item),
+            "data": data,
+        }
+        return ObjectTemplate(d)
+
+    @classmethod
+    def get_kind(cls, item):
+        thing = item.lookups[0]
+        return make_typename(thing.__class__)
+
+    @classmethod
+    def get_json(cls, item):
+        data = {
+            "created": time.mktime(item._date.timetuple()),
+            "created_utc": time.mktime(
+                item._date.astimezone(pytz.UTC).timetuple()) - time.timezone,
+            "id": item._id36,
+            "name": item._fullname,
+        }
+        return data
+
+    @classmethod
+    def get_rendered(cls, item, render_style):
+        data = {
+            "id": item._fullname,
+            "content": item.render(style=render_style),
+        }
+        return data
+
 
 class ThingJsonTemplate(JsonTemplate):
     _data_attrs_ = dict(
@@ -115,15 +185,21 @@ class ThingJsonTemplate(JsonTemplate):
         res =  dict(id = thing._fullname,
                     content = thing.render(style=get_api_subtype()))
         return res
-        
+
     def raw_data(self, thing):
         """
         Complement to rendered_data.  Called when a dictionary of
         thing data attributes is to be sent across the wire.
         """
+        attrs = dict(self._data_attrs_)
+        if hasattr(self, "_optional_data_attrs"):
+            for attr, attrv in self._optional_data_attrs.iteritems():
+                if hasattr(thing, attr):
+                    attrs[attr] = attrv
+
         return dict((k, self.thing_attr(thing, v))
-                    for k, v in self._data_attrs_.iteritems())
-            
+                    for k, v in attrs.iteritems())
+
     def thing_attr(self, thing, attr):
         """
         For the benefit of subclasses, to lookup attributes which may
@@ -135,57 +211,24 @@ class ThingJsonTemplate(JsonTemplate):
             if thing.author._deleted:
                 return "[deleted]"
             return thing.author.name
-        if attr == "author_flair_text":
-            if thing.author._deleted:
-                return None
-            if thing.author.flair_enabled_in_sr(thing.subreddit._id):
-                return getattr(thing.author,
-                               'flair_%s_text' % (thing.subreddit._id),
-                               None)
-            else:
-                return None
-        if attr == "author_flair_css_class":
-            if thing.author._deleted:
-                return None
-            if thing.author.flair_enabled_in_sr(thing.subreddit._id):
-                return getattr(thing.author,
-                               'flair_%s_css_class' % (thing.subreddit._id),
-                               None)
-            else:
-                return None
-        elif attr == "created":
+
+        if attr == "created":
             return time.mktime(thing._date.timetuple())
         elif attr == "created_utc":
             return (time.mktime(thing._date.astimezone(pytz.UTC).timetuple())
                     - time.timezone)
         elif attr == "child":
-            return CachedVariable("childlisting")
-        elif attr == "upvotes":
-            return thing.score
-        elif attr == "downvotes":
-            return 0
+            child = getattr(thing, "child", None)
+            if child:
+                return child.render()
+            else:
+                return ""
 
         if attr == 'distinguished':
             distinguished = getattr(thing, attr, 'no')
             if distinguished == 'no':
                 return None
             return distinguished
-        
-        if attr in ["num_reports", "report_reasons", "banned_by", "approved_by"]:
-            if c.user_is_loggedin and thing.subreddit.is_moderator(c.user):
-                if attr == "num_reports":
-                    return thing.reported
-                elif attr == "report_reasons":
-                    return Report.get_reasons(thing)
-
-                ban_info = getattr(thing, "ban_info", {})
-                if attr == "banned_by":
-                    banner = (ban_info.get("banner")
-                              if ban_info.get('moderator_banned')
-                              else True)
-                    return banner if thing._spam else None
-                elif attr == "approved_by":
-                    return ban_info.get("unbanner") if not thing._spam else None
 
         return getattr(thing, attr, None)
 
@@ -201,18 +244,31 @@ class ThingJsonTemplate(JsonTemplate):
 
 class SubredditJsonTemplate(ThingJsonTemplate):
     _data_attrs_ = ThingJsonTemplate.data_attrs(
-        accounts_active="accounts_active",
+        accounts_active="accounts_active_count",
+        banner_img="banner_img",
+        banner_size="banner_size",
+        collapse_deleted_comments="collapse_deleted_comments",
         comment_score_hide_mins="comment_score_hide_mins",
+        community_rules="community_rules",
         description="description",
         description_html="description_html",
         display_name="name",
         header_img="header",
         header_size="header_size",
         header_title="header_title",
+        icon_img="icon_img",
+        icon_size="icon_size",
+        # key_color="key_color",
+        lang="lang",
         over18="over_18",
         public_description="public_description",
         public_description_html="public_description_html",
         public_traffic="public_traffic",
+        # related_subreddits="related_subreddits",
+        hide_ads="hide_ads",
+        quarantine="quarantine",
+        show_media="show_media",
+        show_media_preview="show_media_preview",
         submission_type="link_type",
         submit_link_label="submit_link_label",
         submit_text_label="submit_text_label",
@@ -220,85 +276,103 @@ class SubredditJsonTemplate(ThingJsonTemplate):
         submit_text_html="submit_text_html",
         subreddit_type="type",
         subscribers="_ups",
+        suggested_comment_sort="suggested_comment_sort",
         title="title",
         url="path",
         user_is_banned="is_banned",
+        user_is_muted="is_muted",
         user_is_contributor="is_contributor",
         user_is_moderator="is_moderator",
         user_is_subscriber="is_subscriber",
+        user_sr_theme_enabled="user_sr_style_enabled",
+        wiki_enabled="wiki_enabled",
     )
 
     # subreddit *attributes* (right side of the equals)
-    # that are only accessible if the user can view the subreddit
-    _private_attrs = set([
-        "accounts_active",
-        "comment_score_hide_mins",
-        "description",
-        "description_html",
-        "header",
-        "header_size",
-        "header_title",
-        "submit_link_label",
-        "submit_text_label",
-    ])
+    # that are accessible even if the user can't view the subreddit
+    _public_attrs = {
+        "_id36",
+        # subreddit ID with prefix
+        "_fullname",
+        # Creation date
+        "created",
+        "created_utc",
+        # Canonically-cased subreddit name
+        "name",
+        # Canonical subreddit URL, relative to reddit.com
+        "path",
+        # Text shown on the access denied page
+        "public_description",
+        "public_description_html",
+        # Title shown in search
+        "title",
+        # Type of subreddit, so people know that it's private
+        "type",
+    }
 
     def raw_data(self, thing):
         data = ThingJsonTemplate.raw_data(self, thing)
+
+        # remove this when feature is enabled and use _data_attrs instead
+        if feature.is_enabled('mobile_settings'):
+            data['key_color'] = self.thing_attr(thing, 'key_color')
+        if feature.is_enabled('related_subreddits'):
+            data['related_subreddits'] = self.thing_attr(thing, 'related_subreddits')
+
         permissions = getattr(thing, 'mod_permissions', None)
         if permissions:
             permissions = [perm for perm, has in permissions.iteritems() if has]
             data['mod_permissions'] = permissions
+
         return data
 
     def thing_attr(self, thing, attr):
-        if attr in self._private_attrs and not thing.can_view(c.user):
+        if attr not in self._public_attrs and not thing.can_view(c.user):
             return None
 
-        if attr == "_ups" and thing.hide_subscribers:
+        if (attr == "_ups" and
+                (thing.hide_subscribers or thing.hide_num_users_info)):
             return 0
-        # Don't return accounts_active counts in /subreddits
-        elif (attr == "accounts_active" and isinstance(c.site, SubSR)):
-            return None
         elif attr == 'description_html':
             return safemarkdown(thing.description)
         elif attr == 'public_description_html':
             return safemarkdown(thing.public_description)
-        elif attr in ('is_banned', 'is_contributor', 'is_moderator',
-                      'is_subscriber'):
+        elif attr == "is_moderator":
             if c.user_is_loggedin:
-                check_func = getattr(thing, attr)
-                return bool(check_func(c.user))
+                return thing.moderator
+            return None
+        elif attr == "is_contributor":
+            if c.user_is_loggedin:
+                return thing.contributor
+            return None
+        elif attr == "is_subscriber":
+            if c.user_is_loggedin:
+                return thing.subscriber
+            return None
+        elif attr == 'is_banned':
+            if c.user_is_loggedin:
+                return thing.banned
+            return None
+        elif attr == 'is_muted':
+            if c.user_is_loggedin:
+                return thing.muted
             return None
         elif attr == 'submit_text_html':
             return safemarkdown(thing.submit_text)
+        elif attr == 'user_sr_style_enabled':
+            if c.user_is_loggedin:
+                return c.user.use_subreddit_style(thing)
+            else:
+                return True
+        elif attr == 'wiki_enabled':
+            is_admin_or_mod = c.user_is_loggedin and (
+                c.user_is_admin or thing.is_moderator_with_perms(c.user, 'wiki')
+            )
+
+            return thing.wikimode == 'anyone' or (thing.wikimode == 'modonly' and is_admin_or_mod)
         else:
             return ThingJsonTemplate.thing_attr(self, thing, attr)
 
-class LabeledMultiJsonTemplate(ThingJsonTemplate):
-    _data_attrs_ = ThingJsonTemplate.data_attrs(
-        can_edit="can_edit",
-        name="name",
-        path="path",
-        subreddits="srs",
-        visibility="visibility",
-    )
-    del _data_attrs_["id"]
-
-    def kind(self, wrapped):
-        return "LabeledMulti"
-
-    @classmethod
-    def sr_props(cls, thing, srs):
-        sr_props = thing.sr_props
-        return [dict(sr_props[sr._id], name=sr.name) for sr in srs]
-
-    def thing_attr(self, thing, attr):
-        if attr == "srs":
-            return self.sr_props(thing, thing.srs)
-        elif attr == "can_edit":
-            return c.user_is_loggedin and thing.can_edit(c.user)
-        else:
-            return ThingJsonTemplate.thing_attr(self, thing, attr)
 
 class LabeledMultiDescriptionJsonTemplate(ThingJsonTemplate):
     _data_attrs_ = dict(
@@ -317,6 +391,105 @@ class LabeledMultiDescriptionJsonTemplate(ThingJsonTemplate):
         else:
             return ThingJsonTemplate.thing_attr(self, thing, attr)
 
+
+class LabeledMultiJsonTemplate(LabeledMultiDescriptionJsonTemplate):
+    _data_attrs_ = ThingJsonTemplate.data_attrs(
+        can_edit="can_edit",
+        copied_from="copied_from",
+        description_html="description_html",
+        description_md="description_md",
+        display_name="display_name",
+        key_color="key_color",
+        icon_name="icon_id",
+        icon_url="icon_url",
+        name="name",
+        path="path",
+        subreddits="srs",
+        visibility="visibility",
+        weighting_scheme="weighting_scheme",
+    )
+    del _data_attrs_["id"]
+
+    def __init__(self, expand_srs=False):
+        super(LabeledMultiJsonTemplate, self).__init__()
+        self.expand_srs = expand_srs
+
+    def kind(self, wrapped):
+        return "LabeledMulti"
+
+    @classmethod
+    def sr_props(cls, thing, srs, expand=False):
+        sr_props = dict(thing.sr_props)
+        if expand:
+            sr_dicts = get_trimmed_sr_dicts(srs, c.user)
+            for sr in srs:
+                sr_props[sr._id]["data"] = sr_dicts[sr._id]
+        return [dict(sr_props[sr._id], name=sr.name) for sr in srs]
+
+    def thing_attr(self, thing, attr):
+        if attr == "srs":
+            return self.sr_props(thing, thing.srs, expand=self.expand_srs)
+        elif attr == "can_edit":
+            return c.user_is_loggedin and thing.can_edit(c.user)
+        elif attr == "copied_from":
+            if thing.can_edit(c.user):
+                return thing.copied_from
+            else:
+                return None
+        elif attr == "display_name":
+            return thing.display_name or thing.name
+        else:
+            super_ = super(LabeledMultiJsonTemplate, self)
+            return super_.thing_attr(thing, attr)
+
+
+def get_trimmed_sr_dicts(srs, user):
+    if c.user_is_loggedin:
+        sr_user_relations = Subreddit.get_sr_user_relations(user, srs)
+    else:
+        # backwards compatibility: for loggedout users don't return boolean,
+        # instead return None for all relations.
+        NO_SR_USER_RELATIONS = SubredditUserRelations(
+            subscriber=None,
+            moderator=None,
+            contributor=None,
+            banned=None,
+            muted=None,
+        )
+        sr_user_relations = defaultdict(lambda: NO_SR_USER_RELATIONS)
+
+    ret = {}
+    for sr in srs:
+        relations = sr_user_relations[sr._id]
+        can_view = sr.can_view(user)
+        subscribers = sr._ups if not sr.hide_subscribers else 0
+
+        data = dict(
+            name=sr._fullname,
+            display_name=sr.name,
+            url=sr.path,
+            banner_img=sr.banner_img if can_view else None,
+            banner_size=sr.banner_size if can_view else None,
+            header_img=sr.header if can_view else None,
+            header_size=sr.header_size if can_view else None,
+            icon_img=sr.icon_img if can_view else None,
+            icon_size=sr.icon_size if can_view else None,
+            key_color=sr.key_color if can_view else None,
+            subscribers=subscribers if can_view else None,
+            user_is_banned=relations.banned if can_view else None,
+            user_is_muted=relations.muted if can_view else None,
+            user_is_contributor=relations.contributor if can_view else None,
+            user_is_moderator=relations.moderator if can_view else None,
+            user_is_subscriber=relations.subscriber if can_view else None,
+        )
+
+        if feature.is_enabled('mobile_settings'):
+            data["key_color"] = sr.key_color if can_view else None
+
+        ret[sr._id] = data
+    return ret
+
+
 class IdentityJsonTemplate(ThingJsonTemplate):
     _data_attrs_ = ThingJsonTemplate.data_attrs(
         comment_karma="comment_karma",
@@ -325,23 +498,50 @@ class IdentityJsonTemplate(ThingJsonTemplate):
         is_mod="is_mod",
         link_karma="link_karma",
         name="name",
+        hide_from_robots="pref_hide_from_robots",
     )
     _private_data_attrs = dict(
+        inbox_count="inbox_count",
         over_18="pref_over_18",
         gold_creddits="gold_creddits",
+        gold_expiration="gold_expiration",
+        is_suspended="in_timeout",
+        suspension_expiration_utc="timeout_expiration_utc",
+        features="features",
     )
+    _public_attrs = {
+        "name",
+        "is_suspended",
+    }
 
     def raw_data(self, thing):
+        viewable = True
         attrs = self._data_attrs_.copy()
         if c.user_is_loggedin and thing._id == c.user._id:
             attrs.update(self._private_data_attrs)
-        data = {k: self.thing_attr(thing, v) for k, v in attrs.iteritems()}
+        # Add a public indication when a user is permanently in timeout.
+        elif (thing.in_timeout and thing.timeout_expiration is None):
+            attrs.update({"is_suspended": "in_timeout"})
+            viewable = False
+
+        if thing.pref_hide_from_robots:
+            response.headers['X-Robots-Tag'] = 'noindex, nofollow'
+
+        data = {k: self.thing_attr(thing, v) for k, v in attrs.iteritems()
+                if viewable or k in self._public_attrs}
         try:
             self.add_message_data(data, thing)
         except OAuth2Scope.InsufficientScopeError:
             # No access to privatemessages, but the rest of
             # the identity information is sufficient.
             pass
+
+        # Add as private data attributes states about this user. This is used
+        # for feature flagging by user state on first-party API clients.
+        if c.user_is_loggedin and thing._id == c.user._id:
+            data['is_employee'] = thing.employee
+            data['in_beta'] = thing.pref_beta
+
         return data
 
     @extra_oauth2_scope("privatemessages")
@@ -364,6 +564,18 @@ class IdentityJsonTemplate(ThingJsonTemplate):
             return display_comment_karma(thing.comment_karma)
         elif attr == "link_karma":
             return display_link_karma(thing.link_karma)
+        elif attr == "gold_expiration":
+            if not thing.gold:
+                return None
+            return calendar.timegm(thing.gold_expiration.utctimetuple())
+        elif attr == "timeout_expiration_utc":
+            expiration_date = thing.timeout_expiration
+            if not expiration_date:
+                return None
+
+            return calendar.timegm(expiration_date.utctimetuple())
+        elif attr == "features":
+            return feature.all_enabled(c.user)
 
         return ThingJsonTemplate.thing_attr(self, thing, attr)
 
@@ -403,206 +615,417 @@ class PrefsJsonTemplate(ThingJsonTemplate):
         return ThingJsonTemplate.thing_attr(self, thing, attr)
 
 
-class LinkJsonTemplate(ThingJsonTemplate):
-    _data_attrs_ = ThingJsonTemplate.data_attrs(
-        approved_by="approved_by",
-        author="author",
-        author_flair_css_class="author_flair_css_class",
-        author_flair_text="author_flair_text",
-        banned_by="banned_by",
-        visited="visited",
-        clicked="clicked",
-        distinguished="distinguished",
-        domain="domain",
-        downs="downvotes",
-        edited="editted",
-        gilded="gildings",
-        hidden="hidden",
-        is_self="is_self",
-        likes="likes",
-        link_flair_css_class="flair_css_class",
-        link_flair_text="flair_text",
-        media="media_object",
-        media_embed="media_embed",
-        num_comments="num_comments",
-        num_reports="num_reports",
-        report_reasons="report_reasons",
-        mod_reports="mod_reports",
-        user_reports="user_reports",
-        over_18="over_18",
-        permalink="permalink",
-        saved="saved",
-        score="score",
-        secure_media="secure_media_object",
-        secure_media_embed="secure_media_embed",
-        selftext="selftext",
-        selftext_html="selftext_html",
-        stickied="stickied",
-        subreddit="subreddit",
-        subreddit_id="subreddit_id",
-        thumbnail="thumbnail",
-        title="title",
-        ups="upvotes",
-        url="url",
+def get_mod_attributes(item):
+    data = {}
+    if c.user_is_loggedin and item.can_ban:
+        data["num_reports"] = item.reported
+        data["report_reasons"] = Report.get_reasons(item)
+
+        ban_info = getattr(item, "ban_info", {})
+        if item._spam:
+            data["approved_by"] = None
+            if ban_info.get('moderator_banned'):
+                data["banned_by"] = ban_info.get("banner")
+            else:
+                data["banned_by"] = True
+        else:
+            data["approved_by"] = ban_info.get("unbanner")
+            data["banned_by"] = None
+    else:
+        data["num_reports"] = None
+        data["report_reasons"] = None
+        data["approved_by"] = None
+        data["banned_by"] = None
+    return data
+
+
+def get_author_attributes(item):
+    data = {}
+    if not item.author._deleted:
+        author = item.author
+        sr_id = item.subreddit._id
+
+        data["author"] = author.name
+
+        if author.flair_enabled_in_sr(sr_id):
+            flair_text = getattr(author, 'flair_%s_text' % sr_id, None)
+            flair_css = getattr(author, 'flair_%s_css_class' % sr_id, None)
+        else:
+            flair_text = None
+            flair_css = None
+        data["author_flair_text"] = flair_text
+        data["author_flair_css_class"] = flair_css
+
+    else:
+        data["author"] = "[deleted]"
+        data["author_flair_text"] = None
+        data["author_flair_css_class"] = None
+    return data
+
+
+def get_distinguished_attributes(item):
+    data = {}
+    distinguished = getattr(item, "distinguished", "no")
+    data["distinguished"] = distinguished if distinguished != "no" else None
+    return data
+
+
+def get_edited_attributes(item):
+    data = {}
+    if isinstance(item.editted, bool):
+        data["edited"] = item.editted
+    else:
+        editted_timetuple = item.editted.astimezone(pytz.UTC).timetuple()
+        data["edited"] = time.mktime(editted_timetuple) - time.timezone
+    return data
+
+
+def get_report_reason_attributes(item):
+    if c.user_is_loggedin and c.user.in_timeout:
+        data = {
+            "user_reports": [],
+            "mod_reports": [],
+        }
+    else:
+        data = {
+            "user_reports": item.user_reports,
+            "mod_reports": item.mod_reports,
+        }
+    return data
+
+
+def get_removal_reason_attributes(item):
+    data = {}
+    if getattr(item, "admin_takedown", None):
+        data["removal_reason"] = "legal"
+    else:
+        data["removal_reason"] = None
+    return data
+
+
+def get_media_embed_attributes(item):
+    from r2.lib.media import get_media_embed
+
+    data = {
+        "media_embed": {},
+        "secure_media_embed": {},
+    }
+
+    media_object = item.media_object
+    if media_object and not isinstance(media_object, basestring):
+        media_embed = get_media_embed(media_object)
+        if media_embed:
+            data["media_embed"] = {
+                "scrolling": media_embed.scrolling,
+                "width": media_embed.width,
+                "height": media_embed.height,
+                "content": media_embed.content,
+            }
+
+    secure_media_object = item.secure_media_object
+    if secure_media_object and not isinstance(secure_media_object, basestring):
+        secure_media_embed = get_media_embed(secure_media_object)
+        if secure_media_embed:
+            data["secure_media_embed"] = {
+                "scrolling": secure_media_embed.scrolling,
+                "width": secure_media_embed.width,
+                "height": secure_media_embed.height,
+                "content": secure_media_embed.content,
+            }
+    return data
+
+
+def get_selftext_attributes(item):
+    data = {}
+    if not item.expunged:
+        data["selftext"] = item.selftext
+        data["selftext_html"] = safemarkdown(item.selftext)
+    else:
+        data["selftext"] = "[removed]"
+        data["selftext_html"] = safemarkdown(_("[removed]"))
+    return data
+
+
+def generate_image_links(preview_object, file_type=None, censor_nsfw=False):
+    PREVIEW_RESOLUTIONS = (108, 216, 320, 640, 960, 1080)
+    PREVIEW_MAX_RATIO = 2
+
+    # Determine which previews would be feasible with our given dims
+    source_width = preview_object['width']
+    source_height = preview_object['height']
+    source_ratio = float(source_height) / source_width
+
+    # previews with a ratio above the max will be cropped to a lower ratio
+    max_ratio = float(PREVIEW_MAX_RATIO)
+    preview_ratio = min(source_ratio, max_ratio)
+
+    preview_resolutions = []
+    for w in PREVIEW_RESOLUTIONS:
+        if w > source_width:
+            continue
+
+        url = g.image_resizing_provider.resize_image(
+            preview_object,
+            w,
+            file_type=file_type,
+            censor_nsfw=censor_nsfw,
+            max_ratio=PREVIEW_MAX_RATIO,
+        )
+        h = int(w * preview_ratio)
+        preview_resolutions.append({
+            "url": url,
+            "width": w,
+            "height": h,
+        })
+
+    url = g.image_resizing_provider.resize_image(
+        preview_object,
+        file_type=file_type,
+        censor_nsfw=censor_nsfw,
     )
 
-    def thing_attr(self, thing, attr):
-        from r2.lib.media import get_media_embed
-        if attr in ("media_embed", "secure_media_embed"):
-            media_object = getattr(thing, attr.replace("_embed", "_object"))
-            if media_object and not isinstance(media_object, basestring):
-                media_embed = get_media_embed(media_object)
-                if media_embed:
-                    return {
-                        "scrolling": media_embed.scrolling,
-                        "width": media_embed.width,
-                        "height": media_embed.height,
-                        "content": media_embed.content,
-                    }
-            return {}
-        elif attr == "clicked":
-            # this hasn't been used in years.
-            return False
-        elif attr == "editted" and not isinstance(thing.editted, bool):
-            return (time.mktime(thing.editted.astimezone(pytz.UTC).timetuple())
-                    - time.timezone)
-        elif attr == 'subreddit':
-            return thing.subreddit.name
-        elif attr == 'subreddit_id':
-            return thing.subreddit._fullname
-        elif attr == 'selftext':
-            if not thing.expunged:
-                return thing.selftext
-            else:
-                return ''
-        elif attr == 'selftext_html':
-            if not thing.expunged:
-                return safemarkdown(thing.selftext)
-            else:
-                return safemarkdown(_("[removed]"))
-        return ThingJsonTemplate.thing_attr(self, thing, attr)
+    return {
+        "source": {
+            "url": url,
+            "width": source_width,
+            "height": source_height,
+        },
+        "resolutions": preview_resolutions,
+    }
 
-    def raw_data(self, thing):
-        d = ThingJsonTemplate.raw_data(self, thing)
+
+class LinkJsonTemplate(ThingTemplate):
+    @classmethod
+    def get_json(cls, item):
+        data = ThingTemplate.get_json(item)
+
+        data.update(get_mod_attributes(item))
+        data.update(get_author_attributes(item))
+        data.update(get_distinguished_attributes(item))
+        data.update(get_edited_attributes(item))
+        data.update(get_media_embed_attributes(item))
+        data.update(get_report_reason_attributes(item))
+        data.update(get_removal_reason_attributes(item))
+        data.update(get_selftext_attributes(item))
+
+        data.update({
+            "archived": not item.votable,
+            "visited": item.visited,
+            "clicked": False,
+            "contest_mode": item.contest_mode,
+            "domain": item.domain,
+            "downs": 0,
+            "gilded": item.gildings,
+            "hidden": item.hidden,
+            "hide_score": item.hide_score,
+            "is_self": item.is_self,
+            "likes": item.likes,
+            "link_flair_css_class": item.flair_css_class,
+            "link_flair_text": item.flair_text,
+            "locked": item.locked,
+            "media": item.media_object,
+            "secure_media": item.secure_media_object,
+            "num_comments": item.num_comments,
+            "over_18": item.over_18,
+            "quarantine": item.quarantine,
+            "permalink": item.permalink,
+            "saved": item.saved,
+            "score": item.score,
+            "stickied": item.stickied,
+            "subreddit": item.subreddit.name,
+            "subreddit_id": item.subreddit._fullname,
+            "suggested_sort": item.sort_if_suggested(sr=item.subreddit),
+            "thumbnail": item.thumbnail,
+            "title": item.title,
+            "ups": item.score,
+            "url": item.url,
+        })
+
+        if hasattr(item, "action_type"):
+            data["action_type"] = item.action_type
+
+        if hasattr(item, "sr_detail"):
+            data["sr_detail"] = item.sr_detail
+
+        if hasattr(item, "show_media"):
+            data["show_media"] = item.show_media
 
         if c.permalink_page:
-            d["upvote_ratio"] = thing.upvote_ratio
+            data["upvote_ratio"] = item.upvote_ratio
 
-        return d
+        preview_object = item.preview_image
+        if preview_object:
+            preview_is_gif = preview_object.get('url', '').endswith('.gif')
+            data['preview'] = {}
+            data['post_hint'] = item.post_hint
+            # For gifs, the default preview should be a static image, with the
+            # full gif as a variant
+            if preview_is_gif:
+                images = generate_image_links(preview_object, file_type="jpg")
+            else:
+                images = generate_image_links(preview_object)
 
-    def rendered_data(self, thing):
-        d = ThingJsonTemplate.rendered_data(self, thing)
-        d['sr'] = thing.subreddit._fullname
-        return d
+            images['id'] = preview_object['uid']
+            images['variants'] = {}
+            if item.nsfw:
+                images['variants']['nsfw'] = generate_image_links(
+                    preview_object, censor_nsfw=True, file_type="png")
+            if preview_is_gif:
+                images['variants']['gif'] = generate_image_links(
+                    preview_object)
+                images['variants']['mp4'] = generate_image_links(
+                    preview_object, file_type="mp4")
+            data['preview']['images'] = [images]
+        return data
+
+    @classmethod
+    def get_rendered(cls, item, render_style):
+        data = ThingTemplate.get_rendered(item, render_style)
+        data.update({
+            "sr": item.subreddit._fullname,
+        })
+        return data
 
 
 class PromotedLinkJsonTemplate(LinkJsonTemplate):
-    _data_attrs_ = LinkJsonTemplate.data_attrs(
-        promoted="promoted",
-    )
-    del _data_attrs_['author']
+    @classmethod
+    def get_json(cls, item):
+        data = LinkJsonTemplate.get_json(item)
+        data.update({
+            "promoted": item.promoted,
+            "imp_pixel": getattr(item, "imp_pixel", None),
+            "href_url": item.href_url,
+            "adserver_imp_pixel": getattr(item, "adserver_imp_pixel", None),
+            "adserver_click_url": getattr(item, "adserver_click_url", None),
+            "mobile_ad_url": item.mobile_ad_url,
+            "disable_comments": item.disable_comments,
+            "third_party_tracking": item.third_party_tracking,
+            "third_party_tracking_2": item.third_party_tracking_2,
+        })
 
-class CommentJsonTemplate(ThingJsonTemplate):
-    _data_attrs_ = ThingJsonTemplate.data_attrs(
-        approved_by="approved_by",
-        author="author",
-        author_flair_css_class="author_flair_css_class",
-        author_flair_text="author_flair_text",
-        banned_by="banned_by",
-        body="body",
-        body_html="body_html",
-        distinguished="distinguished",
-        controversiality="controversiality",
-        downs="downvotes",
-        edited="editted",
-        gilded="gilded",
-        likes="likes",
-        link_id="link_id",
-        num_reports="num_reports",
-        report_reasons="report_reasons",
-        mod_reports="mod_reports",
-        user_reports="user_reports",
-        parent_id="parent_id",
-        replies="child",
-        saved="saved",
-        score="score",
-        score_hidden="score_hidden",
-        subreddit="subreddit",
-        subreddit_id="subreddit_id",
-        ups="upvotes",
-    )
+        del data["subreddit"]
+        del data["subreddit_id"]
+        return data
 
-    def thing_attr(self, thing, attr):
-        from r2.models import Comment, Link, Subreddit
-        if attr == 'link_id':
-            return make_fullname(Link, thing.link_id)
-        elif attr == "controversiality":
-            return 1 if thing.is_controversial else 0
-        elif attr == "editted" and not isinstance(thing.editted, bool):
-            return (time.mktime(thing.editted.astimezone(pytz.UTC).timetuple())
-                    - time.timezone)
-        elif attr == 'subreddit':
-            return thing.subreddit.name
-        elif attr == 'subreddit_id':
-            return thing.subreddit._fullname
-        elif attr == "parent_id":
-            if getattr(thing, "parent_id", None):
-                return make_fullname(Comment, thing.parent_id)
-            else:
-                return make_fullname(Link, thing.link_id)
-        elif attr == "body_html":
-            return spaceCompress(safemarkdown(thing.body))
-        elif attr == "gilded":
-            return thing.gildings
 
-        return ThingJsonTemplate.thing_attr(self, thing, attr)
+class CommentJsonTemplate(ThingTemplate):
+    @classmethod
+    def get_parent_id(cls, item):
+        from r2.models import Comment, Link
 
-    def kind(self, wrapped):
-        from r2.models import Comment
-        return make_typename(Comment)
+        if getattr(item, "parent_id", None):
+            return make_fullname(Comment, item.parent_id)
+        else:
+            return make_fullname(Link, item.link_id)
 
-    def raw_data(self, thing):
-        d = ThingJsonTemplate.raw_data(self, thing)
+    @classmethod
+    def get_link_name(cls, item):
+        from r2.models import Link
+        return make_fullname(Link, item.link_id)
+
+    @classmethod
+    def render_child(cls, item):
+        child = getattr(item, "child", None)
+        if child:
+            return child.render()
+        else:
+            return ""
+
+    @classmethod
+    def get_json(cls, item):
+        from r2.models import Link
+
+        data = ThingTemplate.get_json(item)
+
+        data.update(get_mod_attributes(item))
+        data.update(get_author_attributes(item))
+        data.update(get_distinguished_attributes(item))
+        data.update(get_edited_attributes(item))
+        data.update(get_report_reason_attributes(item))
+        data.update(get_removal_reason_attributes(item))
+
+        data.update({
+            "archived": not item.votable,
+            "body": item.body,
+            "body_html": spaceCompress(safemarkdown(item.body)),
+            "controversiality": 1 if item.is_controversial else 0,
+            "downs": 0,
+            "gilded": item.gildings,
+            "likes": item.likes,
+            "link_id": cls.get_link_name(item),
+            "saved": item.saved,
+            "score": item.score,
+            "score_hidden": item.score_hidden,
+            "subreddit": item.subreddit.name,
+            "subreddit_id": item.subreddit._fullname,
+            "ups": item.score,
+            "replies": cls.render_child(item),
+            "parent_id": cls.get_parent_id(item),
+        })
+
+        if feature.is_enabled('sticky_comments'):
+            data["stickied"] = item.link.sticky_comment_id == item._id
+
+        if hasattr(item, "action_type"):
+            data["action_type"] = item.action_type
+
         if c.profilepage:
-            d['link_title'] = thing.link.title
-            d['link_author'] = thing.link_author.name
-            if thing.link.is_self:
-                d['link_url'] = thing.link.make_permalink(thing.subreddit,
-                                                          force_domain=True)
+            data["quarantine"] = item.subreddit.quarantine
+            data["over_18"] = item.link.is_nsfw
+
+            data["link_title"] = item.link.title
+            data["link_author"] = item.link_author.name
+
+            if item.link.is_self:
+                link_url = item.link.make_permalink(
+                    item.subreddit, force_domain=True)
             else:
-                d['link_url'] = thing.link.url
-        return d
+                link_url = item.link.url
+            data["link_url"] = link_url
 
-    def rendered_data(self, wrapped):
-        d = ThingJsonTemplate.rendered_data(self, wrapped)
-        d['replies'] = self.thing_attr(wrapped, 'child')
-        d['contentText'] = self.thing_attr(wrapped, 'body')
-        d['contentHTML'] = self.thing_attr(wrapped, 'body_html')
-        d['link'] = self.thing_attr(wrapped, 'link_id')
-        d['parent'] = self.thing_attr(wrapped, 'parent_id')
-        return d
+        return data
 
-class MoreCommentJsonTemplate(CommentJsonTemplate):
-    _data_attrs_ = dict(
-        children="children",
-        count="count",
-        id="_id36",
-        name="_fullname",
-        parent_id="parent_id",
-    )
+    @classmethod
+    def get_rendered(cls, item, render_style):
+        data = ThingTemplate.get_rendered(item, render_style)
+        data.update({
+            "replies": cls.render_child(item),
+            "contentText": item.body,
+            "contentHTML": spaceCompress(safemarkdown(item.body)),
+            "link": cls.get_link_name(item),
+            "parent": cls.get_parent_id(item),
+        })
+        return data
 
-    def kind(self, wrapped):
+
+class MoreCommentJsonTemplate(ThingTemplate):
+    @classmethod
+    def get_kind(cls, item):
         return "more"
 
-    def thing_attr(self, thing, attr):
-        if attr == 'children':
-            return [to36(x) for x in thing.children]
-        if attr in ('body', 'body_html'):
-            return ""
-        return CommentJsonTemplate.thing_attr(self, thing, attr)
+    @classmethod
+    def get_json(cls, item):
+        data = {
+            "children": [to36(comment_id) for comment_id in item.children],
+            "count": item.count,
+            "id": item._id36,
+            "name": item._fullname,
+            "parent_id": CommentJsonTemplate.get_parent_id(item),
+        }
+        return data
 
-    def rendered_data(self, wrapped):
-        return CommentJsonTemplate.rendered_data(self, wrapped)
+    @classmethod
+    def get_rendered(cls, item, render_style):
+        data = ThingTemplate.get_rendered(item, render_style)
+        data.update({
+            "replies": "",
+            "contentText": "",
+            "contentHTML": "",
+            "link": CommentJsonTemplate.get_link_name(item),
+            "parent": CommentJsonTemplate.get_parent_id(item),
+        })
+        return data
+
 
 class MessageJsonTemplate(ThingJsonTemplate):
     _data_attrs_ = ThingJsonTemplate.data_attrs(
@@ -721,6 +1144,23 @@ class ListingJsonTemplate(ThingJsonTemplate):
     def kind(self, wrapped):
         return "Listing"
 
+
+class SearchListingJsonTemplate(ListingJsonTemplate):
+    def raw_data(self, thing):
+        data = ThingJsonTemplate.raw_data(self, thing)
+
+        def format_sr(sr, count):
+            return {'name': sr.name, 'url': sr.path, 'count': count}
+
+        facets = {}
+        if thing.subreddit_facets:
+            facets['subreddits'] = [format_sr(sr, count)
+                                    for sr, count in thing.subreddit_facets]
+        data['facets'] = facets
+
+        return data
+
+
 class UserListingJsonTemplate(ListingJsonTemplate):
     def raw_data(self, thing):
         if not thing.nextprev:
@@ -804,6 +1244,10 @@ class BannedTableItemJsonTemplate(RelTableItemJsonTemplate):
     _data_attrs_ = RelTableItemJsonTemplate.data_attrs(
         note="rel.note",
     )
+
+
+class MutedTableItemJsonTemplate(RelTableItemJsonTemplate):
+    pass
 
 
 class InvitedModTableItemJsonTemplate(RelTableItemJsonTemplate):
@@ -901,7 +1345,7 @@ class FlairListJsonTemplate(JsonTemplate):
                           flair_css_class=row.flair_css_class)
             else:
               # prev/next link
-              return dict(after=row.after, reverse=row.reverse)
+              return dict(after=row.after, reverse=row.previous)
 
         json_rows = [row_to_json(row) for row in thing.flair]
         result = dict(users=[row for row in json_rows if 'user' in row])
@@ -1002,25 +1446,30 @@ class StylesheetTemplate(ThingJsonTemplate):
 
 class SubredditSettingsTemplate(ThingJsonTemplate):
     _data_attrs_ = dict(
+        allow_images='site.allow_images',
+        collapse_deleted_comments='site.collapse_deleted_comments',
         comment_score_hide_mins='site.comment_score_hide_mins',
         content_options='site.link_type',
         default_set='site.allow_top',
         description='site.description',
         domain='site.domain',
-        domain_css='site.css_on_cname',
-        domain_sidebar='site.show_cname_sidebar',
         exclude_banned_modqueue='site.exclude_banned_modqueue',
         header_hover_text='site.header_title',
+        # key_color='site.key_color',
         language='site.lang',
         over_18='site.over_18',
         public_description='site.public_description',
         public_traffic='site.public_traffic',
+        # related_subreddits='site.related_subreddits',
+        hide_ads="site.hide_ads",
         show_media='site.show_media',
+        show_media_preview='site.show_media_preview',
         submit_link_label='site.submit_link_label',
         submit_text_label='site.submit_text_label',
         submit_text='site.submit_text',
         subreddit_id='site._fullname',
         subreddit_type='site.type',
+        suggested_comment_sort="site.suggested_comment_sort",
         title='site.title',
         wiki_edit_age='site.wiki_edit_age',
         wiki_edit_karma='site.wiki_edit_karma',
@@ -1036,7 +1485,30 @@ class SubredditSettingsTemplate(ThingJsonTemplate):
     def thing_attr(self, thing, attr):
         if attr.startswith('site.') and thing.site:
             return getattr(thing.site, attr[5:])
+        if attr == 'related_subreddits' and thing.site:
+            # string used for form input
+            return '\n'.join(thing.site.related_subreddits)
         return ThingJsonTemplate.thing_attr(self, thing, attr)
+
+    def raw_data(self, thing):
+        data = ThingJsonTemplate.raw_data(self, thing)
+
+        # remove this when feature is enabled and use _data_attrs instead
+        if feature.is_enabled('mobile_settings'):
+            data['key_color'] = self.thing_attr(thing, 'key_color')
+        if feature.is_enabled('related_subreddits'):
+            data['related_subreddits'] = self.thing_attr(thing, 'related_subreddits')
+
+        return data
+
+
+class UploadedImageJsonTemplate(JsonTemplate):
+    def render(self, thing, *a, **kw):
+        return ObjectTemplate({
+            "errors": list(k for (k, v) in thing.errors if v),
+            "img_src": thing.img_src,
+        })
+
 
 class ModActionTemplate(ThingJsonTemplate):
     _data_attrs_ = dict(
@@ -1045,17 +1517,44 @@ class ModActionTemplate(ThingJsonTemplate):
         description='description',
         details='details',
         id='_fullname',
-        mod='author',
+        mod='moderator',
         mod_id36='mod_id36',
         sr_id36='sr_id36',
-        subreddit='sr_name',
+        subreddit='subreddit',
+        target_author='target_author',
         target_fullname='target_fullname',
+        target_permalink='target_permalink',
+        target_title='target_title',
+        target_body='target_body',
     )
 
     def thing_attr(self, thing, attr):
         if attr == 'date':
             return (time.mktime(thing.date.astimezone(pytz.UTC).timetuple())
                     - time.timezone)
+        elif attr == 'target_author':
+            if thing.target_author and thing.target_author._deleted:
+                return "[deleted]"
+            elif thing.target_author:
+                return thing.target_author.name
+            return ""
+        elif attr == 'target_permalink':
+            try:
+                return thing.target.make_permalink_slow()
+            except AttributeError:
+                return None
+        elif attr == "moderator":
+            return thing.moderator.name
+        elif attr == "subreddit":
+            return thing.subreddit.name
+        elif attr == 'target_title' and isinstance(thing.target, Link):
+            return thing.target.title
+        elif attr == 'target_body' and isinstance(thing.target, Comment):
+            return thing.target.body
+        elif (attr == 'target_body' and isinstance(thing.target, Link)
+              and getattr(thing.target, 'selftext', None)):
+            return thing.target.selftext
+
         return ThingJsonTemplate.thing_attr(self, thing, attr)
 
     def kind(self, wrapped):
@@ -1086,6 +1585,16 @@ class KarmaListJsonTemplate(ThingJsonTemplate):
 
     def kind(self, wrapped):
         return "KarmaList"
+
+
+def get_usertrophies(user):
+    trophies = Trophy.by_account(user)
+    def visible_trophy(trophy):
+        return trophy._thing2.awardtype != 'invisible'
+    trophies = filter(visible_trophy, trophies)
+    resp = TrophyListJsonTemplate().render(trophies)
+    return resp.finalize()
+
 
 class TrophyJsonTemplate(ThingJsonTemplate):
     _data_attrs_ = dict(
@@ -1119,3 +1628,18 @@ class TrophyListJsonTemplate(ThingJsonTemplate):
 
     def kind(self, wrapped):
         return "TrophyList"
+
+
+class RulesJsonTemplate(JsonTemplate):
+    def render(self, thing, *a, **kw):
+        rules = {}
+        rules['site_rules'] = thing.site_rules
+        rules['rules'] = thing.rules
+
+        for rule in rules["rules"]:
+            if rule.get("description"):
+                rule["description_html"] = safemarkdown(rule["description"])
+            if not rule.get("kind"):
+                rule["kind"] = "all"
+
+        return ObjectTemplate(rules)

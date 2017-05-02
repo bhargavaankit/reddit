@@ -16,15 +16,16 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from itertools import product
 
+from pycassa.types import IntegerType
+
 from r2.lib.db import tdb_cassandra
 from r2.lib.utils import tup
-from r2.models.subreddit import DefaultSR
 
 
 class PromoMetrics(tdb_cassandra.View):
@@ -71,7 +72,7 @@ class LocationPromoMetrics(tdb_cassandra.View):
     _write_consistency_level = tdb_cassandra.CL.QUORUM
     _read_consistency_level = tdb_cassandra.CL.ONE
     _extra_schema_creation_args = {
-        "default_validation_class": tdb_cassandra.IntegerType(),
+        "default_validation_class": IntegerType(),
     }
 
     @classmethod

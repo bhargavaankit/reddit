@@ -16,12 +16,14 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 import datetime
 import hashlib
+import time
+import email.utils
 from email.MIMEText import MIMEText
 from email.errors import HeaderParseError
 
@@ -31,7 +33,8 @@ from sqlalchemy.dialects.postgresql.base import PGInet
 from r2.lib.db.tdb_sql import make_metadata, index_str, create_table
 from r2.lib.utils import Enum, tup
 from r2.lib.memoize import memoize
-from pylons import g, request
+from pylons import request
+from pylons import app_globals as g
 from pylons.i18n import _
 
 def mail_queue(metadata):
@@ -171,6 +174,7 @@ class EmailHandler(object):
             try:
                 o.insert().values({o.c.email: email,
                                    o.c.msg_hash: msg_hash}).execute()
+                g.stats.simple_event('share.opt_out')
 
                 #clear caches
                 has_opted_out(email, _update = True)
@@ -187,6 +191,7 @@ class EmailHandler(object):
             o = self.opt_table
             if self.has_opted_out(email):
                 sa.delete(o, o.c.email == email).execute()
+                g.stats.simple_event('share.opt_in')
 
                 #clear caches
                 has_opted_out(email, _update = True)
@@ -306,6 +311,12 @@ class Email(object):
                 "REFUNDED_PROMO",
                 "VOID_PAYMENT",
                 "GOLD_GIFT_CODE",
+                "SUSPICIOUS_PAYMENT",
+                "FRAUD_ALERT",
+                "USER_FRAUD",
+                "MESSAGE_NOTIFICATION",
+                "ADS_ALERT",
+                "EDITED_LIVE_PROMO",
                 )
 
     # Do not remove anything from this dictionary!  See above comment.
@@ -317,13 +328,14 @@ class Email(object):
         Kind.OPTIN  : _("[reddit] email addition notice"),
         Kind.RESET_PASSWORD : _("[reddit] reset your password"),
         Kind.VERIFY_EMAIL : _("[reddit] verify your email address"),
-        Kind.BID_PROMO : _("[reddit] your bid has been accepted"),
+        Kind.BID_PROMO : _("[reddit] your budget has been accepted"),
         Kind.ACCEPT_PROMO : _("[reddit] your promotion has been accepted"),
         Kind.REJECT_PROMO : _("[reddit] your promotion has been rejected"),
         Kind.QUEUED_PROMO : _("[reddit] your promotion has been charged"),
         Kind.LIVE_PROMO   : _("[reddit] your promotion is now live"),
         Kind.FINISHED_PROMO : _("[reddit] your promotion has finished"),
         Kind.NEW_PROMO : _("[reddit] your promotion has been created"),
+        Kind.EDITED_LIVE_PROMO : _("[reddit] your promotion edit is being approved"),
         Kind.NERDMAIL : _("[reddit] hey, nerd!"),
         Kind.GOLDMAIL : _("[reddit] reddit gold activation link"),
         Kind.PASSWORD_CHANGE : _("[reddit] your password has been changed"),
@@ -331,6 +343,11 @@ class Email(object):
         Kind.REFUNDED_PROMO: _("[reddit] your campaign didn't get enough impressions"),
         Kind.VOID_PAYMENT: _("[reddit] your payment has been voided"),
         Kind.GOLD_GIFT_CODE: _("[reddit] your reddit gold gift code"),
+        Kind.SUSPICIOUS_PAYMENT: _("[selfserve] suspicious payment alert"),
+        Kind.FRAUD_ALERT: _("[selfserve] fraud alert"),
+        Kind.USER_FRAUD: _("[selfserve] a user has committed fraud"),
+        Kind.MESSAGE_NOTIFICATION: _("[reddit] message notification"),
+        Kind.ADS_ALERT: _("[reddit] Ads Alert"),
         }
 
     def __init__(self, user, thing, email, from_name, date, ip,
@@ -411,12 +428,17 @@ class Email(object):
             self.fr_addr.replace('>', ''),
         )
 
-        if not fr.startswith('-') and not self.to_addr.startswith('-'): # security
+        # Addresses that start with a dash could confuse poorly-written
+        # software's argument parsers, and thus are disallowed by default in
+        # Postfix: http://www.postfix.org/postconf.5.html#allow_min_user
+        if not fr.startswith('-') and not self.to_addr.startswith('-'):
             msg = MIMEText(utf8(self.body, reject_newlines=False))
             msg.set_charset('utf8')
             msg['To']      = utf8(self.to_addr)
             msg['From']    = utf8(fr)
             msg['Subject'] = utf8(self.subject)
+            timestamp = time.mktime(self.date.timetuple())
+            msg['Date'] = utf8(email.utils.formatdate(timestamp))
             if self.user:
                 msg['X-Reddit-username'] = utf8(self.user.name)
             msg['X-Reddit-ID'] = self.msg_hash

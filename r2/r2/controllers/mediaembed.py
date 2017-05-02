@@ -16,14 +16,16 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 import hashlib
 import hmac
 
-from pylons import request, g, c
+from pylons import request
+from pylons import tmpl_context as c
+from pylons import app_globals as g
 from pylons.controllers.util import abort
 
 from r2.controllers.reddit_base import MinimalController
@@ -31,6 +33,7 @@ from r2.lib.pages import MediaEmbedBody
 from r2.lib.media import get_media_embed
 from r2.lib.utils import constant_time_compare
 from r2.lib.validator import validate, VLink, nop
+from r2.models import Subreddit
 
 
 class MediaembedController(MinimalController):
@@ -44,7 +47,7 @@ class MediaembedController(MinimalController):
             # specifically untrusted domain
             abort(404)
 
-        if link.subreddit_slow.type == "private":
+        if link.subreddit_slow.type in Subreddit.private_types:
             expected_mac = hmac.new(g.secrets["media_embed"], link._id36,
                                     hashlib.sha1).hexdigest()
             if not constant_time_compare(credentials or "", expected_mac):
@@ -68,8 +71,5 @@ class MediaembedController(MinimalController):
 
 
 class AdController(MinimalController):
-    def try_pagecache(self):
-        pass
-
     def GET_ad(self):
         return "This is a placeholder ad."

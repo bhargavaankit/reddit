@@ -16,7 +16,7 @@
 ## The Original Developer is the Initial Developer.  The Initial Developer of
 ## the Original Code is reddit Inc.
 ##
-## All portions of the code written by reddit are Copyright (c) 2006-2014
+## All portions of the code written by reddit are Copyright (c) 2006-2015
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
@@ -36,7 +36,8 @@
                  hidden_data=dict(
                    id=c.user._fullname,
                    type=thing.type,
-                   container=thing.container_name))}
+                   container=thing.container_name),
+                 access_required=False)}
   %endif
 
   %if thing.has_invite:
@@ -46,13 +47,15 @@
                question=_("become a moderator of %s?" % ("/r/" + c.site.name)),
                format=_('you are invited to become a moderator. %(action)s'),
                format_arg='action',
-               _class=thing.type + ' accept-invite')}
+               _class=thing.type + ' accept-invite',
+               access_required=False)}
   %endif
 
   %if thing.addable and thing.has_add_form:
     <%call expr="add_form(thing.form_title, thing.destination, thing.type, thing.container_name, verb=_('add'))">
       ${error_field("ALREADY_MODERATOR", "name")}
       ${error_field("BANNED_FROM_SUBREDDIT", "name")}
+      ${error_field("MUTED_FROM_SUBREDDIT", "name")}
     </%call>
   %endif
   ${listing()}

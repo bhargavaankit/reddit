@@ -16,12 +16,12 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from copy import copy
-from pylons import g
+from pylons import app_globals as g
 import os
 from time import time, sleep
 
@@ -31,7 +31,7 @@ from boto.emr.bootstrap_action import BootstrapAction
 from r2.lib.emr_helpers import (
     EmrException,
     EmrJob,
-    get_compatible_jobflows,
+    get_live_clusters,
     get_step_state,
     LIVE_STATES,
     COMPLETED,
@@ -51,7 +51,11 @@ class TrafficBase(EmrJob):
     BOOTSTRAP_NAME = 'traffic binaries'
     BOOTSTRAP_SCRIPT = os.path.join(g.TRAFFIC_SRC_DIR, 'traffic_bootstrap.sh')
     _defaults = dict(master_instance_type='m1.small',
-                     slave_instance_type='m1.xlarge', num_slaves=1)
+                     slave_instance_type='c3.2xlarge', num_slaves=1,
+                     job_flow_role=g.emr_trafic_job_flow_role,
+                     service_role=g.emr_traffic_service_role,
+                     tags=g.emr_traffic_tags,
+                )
 
     def __init__(self, emr_connection, jobflow_name, steps=None, **kw):
         combined_kw = copy(self._defaults)
@@ -120,21 +124,21 @@ class PigCoalesce(PigStep):
 def _add_step(emr_connection, step, jobflow_name, **jobflow_kw):
     """Add step to a running jobflow.
 
-    Append the step onto a compatible jobflow with the specified name if one
-    exists, otherwise create a new jobflow and run it. Returns the jobflowid.
+    Append the step onto a jobflow with the specified name if one exists,
+    otherwise create a new jobflow and run it. Returns the jobflowid.
     NOTE: jobflow_kw will be used to configure the jobflow ONLY if a new
     jobflow is created.
 
     """
 
-    running = get_compatible_jobflows(
-                emr_connection,
-                bootstrap_actions=TrafficBase._bootstrap_actions(),
-                setup_steps=TrafficBase._setup_steps())
+    running = get_live_clusters(emr_connection)
 
-    for jf in running:
-        if jf.name == jobflow_name:
-            jobflowid = jf.jobflowid
+    for cluster in running:
+        # NOTE: the existing cluster's bootstrap actions aren't checked so we
+        # are assuming that any cluster with the correct name is compatible
+        # with our new step
+        if cluster.name == jobflow_name:
+            jobflowid = cluster.id
             emr_connection.add_jobflow_steps(jobflowid, step)
             print 'Added %s to jobflow %s' % (step.name, jobflowid)
             break

@@ -17,7 +17,7 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
@@ -28,28 +28,19 @@ import re
 import subprocess
 import json
 
+from pylons import app_globals as g
+from pylons import tmpl_context as c
+
+from r2.config.paths import get_built_statics_path
+from r2.lib.permissions import ModeratorPermissionSet
+from r2.lib.plugin import PluginLoader
+from r2.lib.static import locate_static_file
 from r2.lib.translation import (
     extract_javascript_msgids,
     get_catalog,
     iter_langs,
     validate_plural_forms,
 )
-from r2.lib.plugin import PluginLoader
-from r2.lib.permissions import ModeratorPermissionSet
-
-
-try:
-    from pylons import g, c, config
-except ImportError:
-    STATIC_ROOT = None
-else:
-    REDDIT_ROOT = config["pylons.paths"]["root"]
-    STATIC_ROOT = config["pylons.paths"]["static_files"]
-
-# STATIC_ROOT will be None if pylons is uninitialized
-if not STATIC_ROOT:
-    REDDIT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    STATIC_ROOT = os.path.join(os.path.dirname(REDDIT_ROOT), "build/public")
 
 
 script_tag = '<script type="text/javascript" src="{src}"></script>\n'
@@ -72,11 +63,11 @@ class Uglify(object):
 
 class Source(object):
     """An abstract collection of JavaScript code."""
-    def get_source(self):
+    def get_source(self, **kwargs):
         """Return the full JavaScript source code."""
         raise NotImplementedError
 
-    def use(self):
+    def use(self, **kwargs):
         """Return HTML to insert the JavaScript source inside a template."""
         raise NotImplementedError
 
@@ -94,39 +85,39 @@ class FileSource(Source):
     def __init__(self, name):
         self.name = name
 
-    def get_source(self):
-        with open(self.path) as f:
+    def __eq__(self, other):
+        return type(self) is type(other) and self.name == other.name
+
+    def get_source(self, use_built_statics=False):
+        if use_built_statics:
+            # we are in the build system so we have already copied all files
+            # into the static build directory
+            built_statics_path = get_built_statics_path()
+            path = os.path.join(built_statics_path, "static", "js", self.name)
+        else:
+            # we are in request so we need to check the pylons static_files
+            # path and the static paths for all plugins
+            path = locate_static_file(os.path.join("static", "js", self.name))
+
+        with open(path) as f:
             return f.read()
 
-    @property
-    def path(self):
-        """The path to the source file on the filesystem."""
-
-        from r2.lib.static import locate_static_file
-
-        try:
-            g.plugins
-        except TypeError:
-            # g.plugins isn't available. this means we're in the build system.
-            # we can safely find all files in one place in this case since the
-            # build system copies them in from plugins first.
-            pass
-        else:
-            # this is in-request. we should check all the plugin directories
-            return locate_static_file(os.path.join("static", "js", self.name))
-
-        return os.path.join(STATIC_ROOT, "static", "js", self.name)
-
-    def use(self):
+    def url(self, absolute=False, mangle_name=False):
         from r2.lib.template_helpers import static
         path = [g.static_path, self.name]
         if g.uncompressedJS:
             path.insert(1, "js")
-        return script_tag.format(src=static(os.path.join(*path)))
+
+        return static(os.path.join(*path), absolute, mangle_name)
+
+    def use(self, **kwargs):
+        return script_tag.format(src=self.url(**kwargs))
 
     @property
     def dependencies(self):
-        return [self.path]
+        built_statics_path = get_built_statics_path()
+        path = os.path.join(built_statics_path, "static", "js", self.name)
+        return [path]
 
 
 class Module(Source):
@@ -136,28 +127,53 @@ class Module(Source):
         self.should_compile = kwargs.get('should_compile', True)
         self.wrap = kwargs.get('wrap')
         self.sources = []
+        filter_module = kwargs.get('filter_module')
+        if isinstance(filter_module, Module):
+            self.filter_sources = filter_module.get_flattened_sources([])
+        else:
+            self.filter_sources = None
         sources = sources or (name,)
         for source in sources:
             if not isinstance(source, Source):
                 if 'prefix' in kwargs:
                     source = os.path.join(kwargs['prefix'], source)
-                source = FileSource(source)
+                source = self.get_default_source(source)
             self.sources.append(source)
 
-    def get_source(self):
-        return ";".join(s.get_source() for s in self.sources)
+    def get_default_source(self, source):
+        return FileSource(source)
+
+    def get_flattened_sources(self, flattened_sources):
+        for s in self.sources:
+            if s in flattened_sources:
+                continue
+            elif isinstance(s, Module):
+                s.get_flattened_sources(flattened_sources)
+            else:
+                flattened_sources.append(s)
+        if self.filter_sources:
+            flattened_sources = [s for s in flattened_sources
+                                 if s not in self.filter_sources]
+        return flattened_sources
+
+    def get_source(self, use_built_statics=False):
+        sources = self.get_flattened_sources([])
+        return ";".join(
+            s.get_source(use_built_statics=use_built_statics)
+            for s in sources
+        )
 
     def extend(self, module):
         self.sources.extend(module.sources)
 
     @property
-    def path(self):
-        """The destination path of the module file on the filesystem."""
-        return os.path.join(STATIC_ROOT, "static", self.name)
+    def destination_path(self):
+        built_statics_path = get_built_statics_path()
+        return os.path.join(built_statics_path, "static", self.name)
 
     def build(self, minifier):
-        with open(self.path, "w") as out:
-            source = self.get_source()
+        with open(self.destination_path, "w") as out:
+            source = self.get_source(use_built_statics=True)
             if self.wrap:
                 source = self.wrap.format(content=source, name=self.name)
 
@@ -169,12 +185,19 @@ class Module(Source):
                 out.write(source)
         print >> sys.stderr, " done."
 
-    def use(self):
+    def url(self, absolute=False, mangle_name=True):
         from r2.lib.template_helpers import static
         if g.uncompressedJS:
-            return "".join(source.use() for source in self.sources)
+            return [source.url(absolute=absolute, mangle_name=mangle_name) for source in self.sources]
         else:
-            return script_tag.format(src=static(self.name))
+            return static(self.name, absolute=absolute, mangle_name=mangle_name)
+
+    def use(self, **kwargs):
+        if g.uncompressedJS:
+            sources = self.get_flattened_sources([])
+            return "".join(source.use(**kwargs) for source in sources)
+        else:
+            return script_tag.format(src=self.url(**kwargs))
 
     @property
     def dependencies(self):
@@ -185,7 +208,7 @@ class Module(Source):
 
     @property
     def outputs(self):
-        return [self.path]
+        return [self.destination_path]
 
 
 class DataSource(Source):
@@ -194,11 +217,11 @@ class DataSource(Source):
         self.wrap = wrap
         self.data = data
 
-    def get_content(self):
+    def get_content(self, **kw):
         return self.data
 
-    def get_source(self):
-        content = self.get_content()
+    def get_source(self, use_built_statics=False):
+        content = self.get_content(use_built_statics=use_built_statics)
         json_data = json.dumps(content)
         return self.wrap.format(content=json_data) + "\n"
 
@@ -238,7 +261,7 @@ class PermissionsDataSource(DataSource):
         else:
             raise ValueError, "unsupported type"
 
-    def get_source(self):
+    def get_source(self, **kw):
         permission_set_info = {k: v.info for k, v in
                                self.permission_sets.iteritems()}
         permissions = self._make_marked_json(permission_set_info)
@@ -259,15 +282,20 @@ class TemplateFileSource(DataSource, FileSource):
         FileSource.__init__(self, name)
         self.name = name
 
-    def get_content(self):
-        from r2.lib.static import locate_static_file
+    def get_content(self, use_built_statics=False):
         name, style = os.path.splitext(self.name)
-        path = locate_static_file(os.path.join('static/js', self.name))
+
+        if use_built_statics:
+            built_statics_path = get_built_statics_path()
+            path = os.path.join(built_statics_path, 'static', 'js', self.name)
+        else:
+            path = locate_static_file(os.path.join('static', 'js', self.name))
+
         with open(path) as f:
             return [{
                 "name": name,
                 "style": style.lstrip('.'),
-                "template": f.read()
+                "template": f.read(),
             }]
 
 
@@ -332,6 +360,10 @@ class LocalizedModule(Module):
         self.localized_appendices = kwargs.pop("localized_appendices", [])
         Module.__init__(self, *args, **kwargs)
 
+        for source in self.sources:
+            if isinstance(source, LocalizedModule):
+                self.localized_appendices.extend(source.localized_appendices)
+
     @staticmethod
     def languagize_path(path, lang):
         path_name, path_ext = os.path.splitext(path)
@@ -340,7 +372,7 @@ class LocalizedModule(Module):
     def build(self, minifier):
         Module.build(self, minifier)
 
-        with open(self.path) as f:
+        with open(self.destination_path) as f:
             reddit_source = f.read()
 
         localized_appendices = self.localized_appendices
@@ -350,7 +382,8 @@ class LocalizedModule(Module):
 
         print >> sys.stderr, "Creating language-specific files:"
         for lang, unused in iter_langs():
-            lang_path = LocalizedModule.languagize_path(self.path, lang)
+            lang_path = LocalizedModule.languagize_path(
+                self.destination_path, lang)
 
             # make sure we're not rewriting a different mangled file
             # via symlink
@@ -363,7 +396,7 @@ class LocalizedModule(Module):
                 for appendix in localized_appendices:
                     out.write(appendix.get_localized_source(lang) + ";")
 
-    def use(self):
+    def use(self, **kwargs):
         from pylons.i18n import get_lang
         from r2.lib.template_helpers import static
         from r2.lib.filters import SC_OFF, SC_ON
@@ -372,12 +405,12 @@ class LocalizedModule(Module):
             if c.lang == "en" or c.lang not in g.all_languages:
                 # in this case, the msgids *are* the translated strings and we
                 # can save ourselves the pricey step of lexing the js source
-                return Module.use(self)
+                return Module.use(self, **kwargs)
 
             msgids = extract_javascript_msgids(Module.get_source(self))
             localized_appendices = self.localized_appendices + [StringsSource(msgids)]
 
-            lines = [Module.use(self)]
+            lines = [Module.use(self, **kwargs)]
             for appendix in localized_appendices:
                 line = SC_OFF + inline_script_tag.format(
                     content=appendix.get_localized_source(c.lang)) + SC_ON
@@ -386,83 +419,215 @@ class LocalizedModule(Module):
         else:
             langs = get_lang() or [g.lang]
             url = LocalizedModule.languagize_path(self.name, langs[0])
-            return script_tag.format(src=static(url))
+            return script_tag.format(src=static(url), **kwargs)
 
     @property
     def outputs(self):
         for lang, unused in iter_langs():
-            yield LocalizedModule.languagize_path(self.path, lang)
+            yield LocalizedModule.languagize_path(self.destination_path, lang)
 
 
-class JQuery(Module):
-    versions = {
-        1: "1.11.1",
-        2: "2.1.1",
-    }
-
-    def __init__(self, cdn_url="http://ajax.googleapis.com/ajax/libs/jquery/{version}/jquery", major_version=1):
-        self.jquery_src = FileSource("lib/jquery-{0}.min.js".format(self.versions[major_version]))
-        Module.__init__(self, "jquery-{0}.min.js".format(self.versions[major_version]), self.jquery_src, should_compile=False)
-        self.cdn_src = cdn_url.format(version=self.versions[major_version])
-
-    def use(self):
-        from r2.lib.template_helpers import static
-        if c.secure or (c.user and c.user.pref_local_js):
-            return Module.use(self)
-        else:
-            ext = ".js" if g.uncompressedJS else ".min.js"
-            return script_tag.format(src=self.cdn_src+ext)
-
-
+_submodule = {}
 module = {}
 
-
-module["jquery1x"] = JQuery(major_version=1)
-module["jquery2x"] = JQuery(major_version=2)
+catch_errors = "try {{ {content} }} catch (err) {{ r.sendError('Error running module', '{name}', ':', err.toString()) }}"
 
 
-module["html5shiv"] = Module("html5shiv.js",
-    "lib/html5shiv.js",
-    should_compile=False
+_submodule["config"] = Module("_setup.js",
+    "base.js",
+    "setup.js",
+    "hooks.js",
 )
 
-catch_errors = "try {{ {content} }} catch (err) {{ r.sendError('Error running module', '{name}', ':', err) }}"
+_submodule["utils"] = Module("_utils.js",
+    "base.js",
+    _submodule["config"],
+    "utils.js",
+)
 
-module["reddit-init"] = LocalizedModule("reddit-init.js",
+_submodule["uibase"] = Module("_uibase.js",
+    "base.js",
+    "i18n.js",
+    _submodule["utils"],
+    "uibase.js",
+)
+
+_submodule["analytics"] = Module("_analytics.js",
+    "base.js",
+    _submodule["config"],
+    _submodule["utils"],
+    "events.js",
+    "analytics.js",
+)
+
+_submodule["errors"] = Module("_errors.js",
+    "base.js",
+    "i18n.js",
+    "errors.js",
+)
+
+_submodule["gate-popup"] = Module("_gate-popup.js",
+    "base.js",
+    _submodule["uibase"],
+    _submodule["errors"],
+    "gate-popup.js",
+)
+
+_submodule["timeouts"] = Module("_timeouts.js",
+    "base.js",
+    _submodule["config"],
+    _submodule["analytics"],
+    _submodule["gate-popup"],
+    "access.js",
+    "timeouts.js",
+)
+
+_submodule["locked"] = Module("_locked.js",
+    "base.js",
+    "access.js",
+    _submodule["gate-popup"],
+    "locked.js",
+)
+
+_submodule["archived"] = Module("_archived.js",
+    "base.js",
+    "hooks.js",
+    _submodule["gate-popup"],
+    "archived.js",
+)
+
+module["gtm-jail"] = Module("gtm-jail.js",
+    "lib/json2.js",
+    "custom-event.js",
+    "frames.js",
+    "google-tag-manager/gtm-jail-listener.js",
+)
+
+
+module["gtm"] = Module("gtm.js",
+    "lib/json2.js",
+    "custom-event.js",
+    "frames.js",
+    "google-tag-manager/gtm-listener.js",
+)
+
+
+module["reddit-embed-base"] = Module("reddit-embed-base.js",
     "lib/es5-shim.js",
     "lib/json2.js",
-    "lib/underscore-1.4.4.js",
+    "base.js",
+    "uuid.js",
+    "custom-event.js",
+    "frames.js",
+    "embed/utils.js",
+    "embed/pixel-tracking.js",
+)
+
+
+module["reddit-embed"] = Module("reddit-embed.js",
+    module["reddit-embed-base"],
+    "embed/embed.js",
+)
+
+
+module["comment-embed"] = Module("comment-embed.js",
+    module["reddit-embed-base"],
+    "embed/comment-embed.js",
+)
+
+
+module["reddit-init-base"] = LocalizedModule("reddit-init-base.js",
+    "lib/modernizr.js",
+    "lib/json2.js",
+    "lib/underscore-1.4.4-1.js",
     "lib/store.js",
     "lib/jed.js",
+    "lib/bootstrap.modal.js",
+    "lib/bootstrap.transition.js",
+    "lib/bootstrap.tooltip.js",
+    "lib/reddit-client-lib.js",
+    "lib/jquery.cookie.js",
+    "lib/event-tracker.js",
+    "lib/hmac-sha256.js",
+    "do-not-track.js",
+    "bootstrap.tooltip.extension.js",
     "base.js",
+    "uuid.js",
+    "hooks.js",
+    "setup.js",
+    "migrate-global-reddit.js",
+    "ajax.js",
+    "safe-store.js",
     "preload.js",
     "logging.js",
     "client-error-logger.js",
-    "jquery.html-patch.js",
+    "voting.js",
     "uibase.js",
     "i18n.js",
     "utils.js",
     "analytics.js",
+    "events.js",
+    "access.js",
+    "reddit-init-hook.js",
     "jquery.reddit.js",
+    "stateify.js",
+    "validator.js",
+    "strength-meter.js",
+    "toggles.js",
     "reddit.js",
+    "sr-autocomplete.js",
     "spotlight.js",
     localized_appendices=[
         PluralForms(),
     ],
+)
+
+module["reddit-init-legacy"] = LocalizedModule("reddit-init-legacy.js",
+    "lib/html5shiv.js",
+    "lib/jquery-1.11.1.js",
+    "lib/es5-shim.js",
+    "lib/es5-sham.js",
+    module["reddit-init-base"],
     wrap=catch_errors,
 )
 
+module["reddit-init"] = LocalizedModule("reddit-init.js",
+    "lib/jquery-2.1.1.js",
+    "lib/es5-shim.js",
+    module["reddit-init-base"],
+    wrap=catch_errors,
+)
+
+module["expando-nsfw-flow"] = Module("expando-nsfw-flow.js",
+    TemplateFileSource('ui/formbar.html'),
+    "ui/formbar.js",
+    TemplateFileSource('expando/nsfwgate.html'),
+    "expando/nsfwflow.js",
+)
+
 module["reddit"] = LocalizedModule("reddit.js",
-    "lib/jquery.cookie.js",
     "lib/jquery.url.js",
     "lib/backbone-1.0.0.js",
+    "custom-event.js",
+    "frames.js",
+    "embed/utils.js",
+    "embed/pixel-tracking.js",
+    "embed/comment-embed.js",
+    "google-tag-manager/gtm.js",
+    "backbone-init.js",
     "timings.js",
     "templates.js",
     "scrollupdater.js",
     "timetext.js",
     "ui.js",
+    "popup.js",
     "login.js",
+    _submodule["locked"],
+    _submodule["timeouts"],
+    _submodule["archived"],
+    "newsletter.js",
     "flair.js",
+    "report.js",
     "interestbar.js",
     "visited.js",
     "wiki.js",
@@ -471,12 +636,30 @@ module["reddit"] = LocalizedModule("reddit.js",
     "multi.js",
     "filter.js",
     "recommender.js",
-    "report.js",
+    "action-forms.js",
+    "embed.js",
+    "post-sharing.js",
+    "expando.js",
+    # inline expando-nsfw-flow.js module here when unflagged
     "saved.js",
+    "cache-poisoning-detection.js",
+    "messages.js",
+    "reddit-hook.js",
+    "link-click-tracking.js",
+    "warn-on-unload.js",
     PermissionsDataSource({
         "moderator": ModeratorPermissionSet,
         "moderator_invite": ModeratorPermissionSet,
     }),
+    wrap=catch_errors,
+    filter_module=module["reddit-init-base"],
+)
+
+module["modtools"] = Module("modtools.js",
+    "errors.js",
+    "models/validators.js",
+    "models/subreddit-rule.js",
+    "edit-subreddit-rules.js",
     wrap=catch_errors,
 )
 
@@ -490,14 +673,8 @@ module["admin"] = Module("admin.js",
 module["mobile"] = LocalizedModule("mobile.js",
     module["reddit"],
     "lib/jquery.lazyload.js",
-    "compact.js"
-)
-
-
-module["button"] = Module("button.js",
-    "lib/jquery.cookie.js",
-    "jquery.reddit.js",
-    "blogbutton.js"
+    "compact.js",
+    filter_module=module["reddit-init-base"],
 )
 
 
@@ -506,9 +683,11 @@ module["policies"] = Module("policies.js",
 )
 
 
-module["sponsored"] = Module("sponsored.js",
+module["sponsored"] = LocalizedModule("sponsored.js",
     "lib/ui.core.js",
     "lib/ui.datepicker.js",
+    "lib/react-with-addons-0.11.2.js",
+    "image-upload.js",
     "sponsored.js"
 )
 
@@ -542,13 +721,42 @@ module["highlight"] = Module("highlight.js",
     "highlight.js",
 )
 
+module["messagecompose"] = Module("messagecompose.js",
+    # jquery, hooks, ajax, preload
+    "messagecompose.js")
+
 module["less"] = Module('less.js',
     'lib/less-1.4.2.js',
     should_compile=False,
 )
 
-def use(*names):
-    return "\n".join(module[name].use() for name in names)
+# This needs to be separate module because we need it to load on old / bad
+# browsers that choke on reddit.js
+module["https-tester"] = Module("https-tester.js",
+    "base.js",
+    "uuid.js",
+    "https-tester.js"
+)
+
+def src(*names, **kwargs):
+    sources = []
+
+    for name in names:
+        urls = module[name].url(**kwargs)
+
+        if isinstance(urls, str) or isinstance(urls, unicode):
+            sources.append(urls)
+        else:
+            for url in list(urls):
+                if isinstance(url, list):
+                    sources.extend(url)
+                else:
+                    sources.append(url)
+
+    return sources
+
+def use(*names, **kwargs):
+    return "\n".join(module[name].use(**kwargs) for name in names)
 
 
 def load_plugin_modules(plugins=None):

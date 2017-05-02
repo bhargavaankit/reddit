@@ -16,17 +16,18 @@
 # The Original Developer is the Initial Developer.  The Initial Developer of
 # the Original Code is reddit Inc.
 #
-# All portions of the code written by reddit are Copyright (c) 2006-2014 reddit
+# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
 # Inc. All Rights Reserved.
 ###############################################################################
 
 from reddit_base import RedditController, UnloggedUser
 from r2.lib.pages import (ButtonLite, ButtonDemoPanel, WidgetDemoPanel,
-                          Bookmarklets, BoringPage)
+                          BoringPage)
 from r2.lib.pages.things import wrap_links
 from r2.models import *
 from r2.lib.validator import *
-from pylons import c, request, response
+from pylons import request, response
+from pylons import tmpl_context as c
 from pylons.i18n import _
 
 class ButtonsController(RedditController):
@@ -85,8 +86,6 @@ class ButtonsController(RedditController):
 
         if not url:
             url = request.referer
-            # we don't want the JS to be cached if the referer was involved.
-            c.used_cache = True
 
         def builder_wrapper(thing = None):
             kw = {}
@@ -114,9 +113,3 @@ class ButtonsController(RedditController):
         return BoringPage(_("reddit widget"),
                           show_sidebar = False, 
                           content=WidgetDemoPanel()).render()
-
-    def GET_bookmarklets(self):
-        return BoringPage(_("bookmarklets"),
-                          show_sidebar = False, 
-                          content=Bookmarklets()).render()
-
